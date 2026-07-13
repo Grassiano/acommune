@@ -1,0 +1,7 @@
+node_modules
+dist
+.test-dist
+*.log
+*.sqlite
+*.sqlite-*
+~/.acommune

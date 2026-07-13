@@ -1,0 +1,16 @@
+{
+  "name": "acommune-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/server.js",
+  "scripts": {
+    "build": "tsc -b",
+    "test": "npm run build && tsc -p tsconfig.test.json && node --test --test-concurrency=1 .test-dist/test/*.test.js"
+  },
+  "dependencies": {
+    "acommune-shared": "*",
+    "better-sqlite3": "12.11.1",
+    "zod": "3.25.76"
+  }
+}
