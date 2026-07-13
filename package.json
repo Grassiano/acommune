@@ -6,12 +6,13 @@
   "workspaces": [
     "shared",
     "relay",
-    "mcp"
+    "mcp",
+    "cli"
   ],
   "scripts": {
-    "build": "tsc -b shared relay mcp",
-    "clean": "tsc -b shared relay mcp --clean",
-    "test": "npm run test --workspace acommune-shared && npm run test --workspace acommune-relay"
+    "build": "tsc -b shared relay mcp cli",
+    "clean": "tsc -b shared relay mcp cli --clean",
+    "test": "npm run test --workspace acommune-shared && npm run test --workspace acommune-relay && npm run test --workspace acommune"
   },
   "devDependencies": {
     "@types/node": "26.0.0",

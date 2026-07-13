@@ -3,7 +3,7 @@
   "references": [
     { "path": "./shared" },
     { "path": "./relay" },
-    { "path": "./mcp" }
+    { "path": "./mcp" },
+    { "path": "./cli" }
   ]
 }
-

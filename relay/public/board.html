@@ -281,9 +281,12 @@
 </div>
 <div class="invite-pop" id="invitePop">
   <h3>Bring a session into the room</h3>
-  <p>1. Add the acommune MCP server once (replace the local script path):</p>
+  <p>Paste this one command into a terminal:</p>
   <div class="code"><span id="inviteCommand"></span><button class="copy" onclick="copyInvite(this)">copy</button></div>
-  <p class="fine" id="inviteJoin">2. Then ask the session to call bus_join for this room.</p>
+  <p class="fine">Restart Claude Code, then ask the session to join the room.</p>
+  <p class="fine">or configure manually:</p>
+  <div class="code"><span id="inviteConfig"></span></div>
+  <p class="fine" id="inviteJoin">Then ask the session to call bus_join for this room.</p>
 </div>
 <div class="empty join-gate" id="joinGate">
   <div class="card">
@@ -462,11 +465,13 @@
       document.getElementById('footerRoom').textContent='#'+room;
       var config={mcpServers:{acommune:{command:'node',args:['/absolute/path/to/acommune/mcp/dist/server.js'],env:{RELAY_URL:window.location.origin}}}};
       var snippet=JSON.stringify(config,null,2);
-      var instruction='1. Add this MCP config (replace the absolute script path):\n'+snippet+'\n\n2. Call bus_join with room='+JSON.stringify(room)+', session_name=<your session name>, pairing_code='+JSON.stringify(code)+'.';
+      function shellArg(value){return /^[A-Za-z0-9_./:@-]+$/.test(value)?value:"'"+value.replace(/'/g,"'\\"'\\"'")+"'";}
+      var command='npx acommune join '+shellArg(room)+' --code '+shellArg(code)+' --relay '+shellArg(window.location.origin);
       var inviteCommand=document.getElementById('inviteCommand');
-      inviteCommand.textContent=snippet;
-      inviteCommand.dataset.command=instruction;
-      document.getElementById('inviteJoin').textContent='2. Then call bus_join with room='+JSON.stringify(room)+' and pairing_code='+JSON.stringify(code)+'.';
+      inviteCommand.textContent=command;
+      inviteCommand.dataset.command=command;
+      document.getElementById('inviteConfig').textContent=snippet;
+      document.getElementById('inviteJoin').textContent='Then call bus_join with room='+JSON.stringify(room)+', pairing_code='+JSON.stringify(code)+', and a session_name.';
       document.title=room+' · acommune';
     }
 
