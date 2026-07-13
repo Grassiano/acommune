@@ -36,10 +36,34 @@ export interface PresenceEntry {
   last_seen: string;
 }
 
+export interface BoardPresenceEntry {
+  session_name: string;
+  last_seen: string;
+  current_claim?: unknown;
+}
+
+export interface BoardMessage {
+  seq: number;
+  sender: string;
+  kind: Kind;
+  body: unknown;
+  ts: string;
+}
+
+export interface BoardState {
+  room: string;
+  presence: BoardPresenceEntry[];
+  messages: BoardMessage[];
+  verified: boolean;
+}
+
+export const BOARD_MESSAGE_BYTES_LIMIT = 256 * 1_024;
+
 interface RoomRow {
   room_id: string;
   name: string;
   pairing_hash: string;
+  pairing_salt: string | null;
   created_at: string;
 }
 
@@ -78,6 +102,20 @@ interface MessageRow {
   body_json: string;
   created_at: string;
   client_msg_id: string | null;
+}
+
+interface BoardPresenceRow {
+  session_name: string;
+  last_seen: string;
+  current_claim_json: string | null;
+}
+
+interface CountRow {
+  count: number;
+}
+
+interface TableColumnRow {
+  name: string;
 }
 
 export class RelayError extends Error {
@@ -121,6 +159,7 @@ function rowToMessage(row: MessageRow): Message {
 
 export class RelayStore {
   readonly #database: DatabaseConnection;
+  readonly #verificationCache = new Map<string, ChainVerification>();
 
   constructor(databasePath: string) {
     if (databasePath !== ":memory:") {
@@ -134,6 +173,7 @@ export class RelayStore {
         room_id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         pairing_hash TEXT NOT NULL,
+        pairing_salt TEXT,
         created_at TEXT NOT NULL
       );
       CREATE UNIQUE INDEX IF NOT EXISTS rooms_name ON rooms(name);
@@ -172,36 +212,61 @@ export class RelayStore {
         PRIMARY KEY(room_id, session_name)
       );
     `);
+    const roomColumns = this.#database
+      .prepare("PRAGMA table_info(rooms)")
+      .all() as TableColumnRow[];
+    if (!roomColumns.some((column) => column.name === "pairing_salt")) {
+      this.#database.exec("ALTER TABLE rooms ADD COLUMN pairing_salt TEXT");
+    }
   }
 
   close(): void {
     this.#database.close();
   }
 
-  createRoom(name: string, pairingCode: string): CreateRoomResult {
+  createRoom(
+    name: string,
+    pairingCode: string,
+    maxRooms = Number.POSITIVE_INFINITY,
+  ): CreateRoomResult {
     return this.#database.transaction(() => {
-      const pairingHash = sha256(pairingCode);
       const existing = this.#database
         .prepare("SELECT * FROM rooms WHERE name = ?")
         .get(name) as RoomRow | undefined;
       if (existing !== undefined) {
-        if (!secureEqual(existing.pairing_hash, pairingHash)) {
+        if (!this.#pairingCodeMatches(existing, pairingCode)) {
           throw new RelayError(
             409,
             "ROOM_NAME_TAKEN",
             "Room name is already in use",
           );
         }
+        this.#migratePairingHash(existing, pairingCode);
         return { room_id: existing.room_id, name: existing.name, created: false };
+      }
+
+      const roomCount = this.#database
+        .prepare("SELECT COUNT(*) AS count FROM rooms")
+        .get() as CountRow;
+      if (roomCount.count >= maxRooms) {
+        throw new RelayError(
+          507,
+          "ROOM_LIMIT_REACHED",
+          "Relay room capacity has been reached",
+        );
       }
 
       const roomId = randomUUID();
       const createdAt = new Date().toISOString();
+      const pairingSalt = randomBytes(16).toString("hex");
+      const pairingHash = sha256(pairingSalt + pairingCode);
       this.#database
         .prepare(
-          "INSERT INTO rooms(room_id, name, pairing_hash, created_at) VALUES (?, ?, ?, ?)",
+          `INSERT INTO rooms(
+             room_id, name, pairing_hash, pairing_salt, created_at
+           ) VALUES (?, ?, ?, ?, ?)`,
         )
-        .run(roomId, name, pairingHash, createdAt);
+        .run(roomId, name, pairingHash, pairingSalt, createdAt);
       this.#database
         .prepare("INSERT INTO room_seq(room_id, next_seq) VALUES (?, 1)")
         .run(roomId);
@@ -226,15 +291,7 @@ export class RelayStore {
     suppliedReclaimToken?: string,
   ): JoinResult {
     return this.#database.transaction(() => {
-      const room = this.#database
-        .prepare("SELECT * FROM rooms WHERE room_id = ?")
-        .get(roomId) as RoomRow | undefined;
-      if (room === undefined) {
-        throw new RelayError(404, "ROOM_NOT_FOUND", "Room not found");
-      }
-      if (!secureEqual(room.pairing_hash, sha256(pairingCode))) {
-        throw new RelayError(401, "INVALID_PAIRING_CODE", "Invalid pairing code");
-      }
+      this.#authenticatePairingCode(roomId, pairingCode);
 
       const existing = this.#database
         .prepare(
@@ -401,7 +458,123 @@ export class RelayStore {
           ORDER BY seq ASC`,
       )
       .all(roomId) as MessageRow[];
-    return verifyChain(rows.map(rowToMessage));
+    const result = verifyChain(rows.map(rowToMessage));
+    this.#verificationCache.set(roomId, result);
+    return result;
+  }
+
+  board(roomId: string, pairingCode: string): BoardState {
+    const room = this.#authenticatePairingCode(roomId, pairingCode);
+    const cutoff = new Date(Date.now() - 30 * 60 * 1_000).toISOString();
+    // A claim is current only while it is the session's latest
+    // claim/progress/handoff event; later progress or handoff supersedes it.
+    const presenceRows = this.#database
+      .prepare(
+        `SELECT s.session_name, s.last_seen,
+                (
+                  SELECT CASE WHEN m.kind = 'claim' THEN m.body_json ELSE NULL END
+                    FROM messages AS m
+                   WHERE m.room_id = s.room_id
+                     AND m.sender = s.session_name
+                     AND m.kind IN ('claim', 'progress', 'handoff')
+                   ORDER BY m.seq DESC
+                   LIMIT 1
+                ) AS current_claim_json
+           FROM sessions AS s
+          WHERE s.room_id = ? AND s.last_seen >= ?
+          ORDER BY s.session_name`,
+      )
+      .all(roomId, cutoff) as BoardPresenceRow[];
+    const presence = presenceRows.map((entry): BoardPresenceEntry => {
+      const base = {
+        session_name: entry.session_name,
+        last_seen: entry.last_seen,
+      };
+      return entry.current_claim_json === null
+        ? base
+        : {
+            ...base,
+            current_claim: JSON.parse(entry.current_claim_json) as unknown,
+          };
+    });
+
+    const rows = this.#database
+      .prepare(
+        `SELECT seq, prev_hash, hash, sender, kind, body_json, created_at,
+                client_msg_id
+           FROM messages
+          WHERE room_id = ?
+          ORDER BY seq DESC
+          LIMIT 200`,
+      )
+      .all(roomId) as MessageRow[];
+    const boundedRows: MessageRow[] = [];
+    let messageBytes = 0;
+    for (const row of rows) {
+      const nextBytes = Buffer.byteLength(row.body_json, "utf8");
+      if (messageBytes + nextBytes > BOARD_MESSAGE_BYTES_LIMIT) {
+        break;
+      }
+      boundedRows.push(row);
+      messageBytes += nextBytes;
+    }
+    const messages = boundedRows.reverse().map((row): BoardMessage => {
+      const message = rowToMessage(row);
+      return {
+        seq: message.seq,
+        sender: message.sender,
+        kind: message.kind,
+        body: message.body,
+        ts: message.ts,
+      };
+    });
+
+    return {
+      room: room.name,
+      presence,
+      messages,
+      verified: this.#cachedVerification(roomId).ok,
+    };
+  }
+
+  #authenticatePairingCode(roomId: string, pairingCode: string): RoomRow {
+    const room = this.#database
+      .prepare("SELECT * FROM rooms WHERE room_id = ?")
+      .get(roomId) as RoomRow | undefined;
+    if (room === undefined) {
+      throw new RelayError(404, "ROOM_NOT_FOUND", "Room not found");
+    }
+    if (!this.#pairingCodeMatches(room, pairingCode)) {
+      throw new RelayError(401, "INVALID_PAIRING_CODE", "Invalid pairing code");
+    }
+    this.#migratePairingHash(room, pairingCode);
+    return room;
+  }
+
+  #pairingCodeMatches(room: RoomRow, pairingCode: string): boolean {
+    const candidate =
+      room.pairing_salt === null
+        ? sha256(pairingCode)
+        : sha256(room.pairing_salt + pairingCode);
+    return secureEqual(room.pairing_hash, candidate);
+  }
+
+  #migratePairingHash(room: RoomRow, pairingCode: string): void {
+    if (room.pairing_salt !== null) {
+      return;
+    }
+    const salt = randomBytes(16).toString("hex");
+    this.#database
+      .prepare(
+        "UPDATE rooms SET pairing_hash = ?, pairing_salt = ? WHERE room_id = ?",
+      )
+      .run(sha256(salt + pairingCode), salt, room.room_id);
+    room.pairing_salt = salt;
+    room.pairing_hash = sha256(salt + pairingCode);
+  }
+
+  #cachedVerification(roomId: string): ChainVerification {
+    return this.#verificationCache.get(roomId) ?? this.verify(roomId);
   }
 
   #authenticate(
@@ -465,6 +638,7 @@ export class RelayStore {
     this.#database
       .prepare("UPDATE room_seq SET next_seq = next_seq + 1 WHERE room_id = ?")
       .run(roomId);
+    this.#verificationCache.delete(roomId);
 
     const base: Message = {
       seq: sequence.next_seq,

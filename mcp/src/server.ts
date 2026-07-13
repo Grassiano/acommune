@@ -161,7 +161,7 @@ server.registerTool(
     inputSchema: {
       ...roomShape,
       session_name: z.string().trim().min(1).max(200),
-      pairing_code: z.string().min(1),
+      pairing_code: z.string().min(6),
     },
   },
   async ({ room, session_name, pairing_code }) => {
@@ -195,7 +195,14 @@ server.registerTool(
         session_name,
         reclaim_token: joined.reclaim_token,
       });
-      return textResult(`Joined ${room} as ${session_name}.`, payload);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Joined ${room} as ${session_name}; identity saved locally.`,
+          },
+        ],
+      };
     } catch (error: unknown) {
       return toolError(error);
     }
@@ -282,11 +289,12 @@ server.registerTool(
   async ({ room }) => {
     try {
       const session = await loadSession(room);
-      const query = new URLSearchParams({
-        reclaim_token: session.reclaim_token,
-      });
       const payload = await relayFetch(
-        `/rooms/${encodeURIComponent(room)}/presence?${query.toString()}`,
+        `/rooms/${encodeURIComponent(room)}/presence`,
+        {
+          method: "POST",
+          body: JSON.stringify({ reclaim_token: session.reclaim_token }),
+        },
       );
       return textResult(`Presence for ${room}.`, payload);
     } catch (error: unknown) {

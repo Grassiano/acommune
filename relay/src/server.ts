@@ -1,24 +1,50 @@
 #!/usr/bin/env node
 import { createServer as createHttpServer, type IncomingMessage, type Server } from "node:http";
+import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { resolve } from "node:path";
+import { dirname, extname, resolve, sep } from "node:path";
 
 import { KINDS, type SyncResult } from "acommune-shared";
 import { z, ZodError } from "zod";
 
-import { RoomNotifier } from "./notifier.js";
+import { RoomNotifier, WaiterLimitError } from "./notifier.js";
 import { RelayError, RelayStore, type OutboxItem } from "./store.js";
 
 export const VERSION = "0.1.0";
 
+const PUBLIC_DIRECTORY = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  "../public",
+);
+
+const CONTENT_TYPES: Readonly<Record<string, string>> = {
+  ".css": "text/css; charset=utf-8",
+  ".html": "text/html; charset=utf-8",
+  ".ico": "image/x-icon",
+  ".jpeg": "image/jpeg",
+  ".jpg": "image/jpeg",
+  ".js": "text/javascript; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".png": "image/png",
+  ".svg": "image/svg+xml",
+  ".webp": "image/webp",
+};
+
 export interface ServerDependencies {
   dbPath?: string;
   version?: string;
+  notifier?: RoomNotifier;
+  roomCreateLimitPerMinute?: number;
+  roomLimit?: number;
+  failedPairingLimitPerMinute?: number;
 }
+
+export const MAX_MESSAGE_BODY_BYTES = 16 * 1_024;
+const RATE_WINDOW_MS = 60_000;
 
 const roomSchema = z.object({
   name: z.string().trim().min(1).max(200),
-  pairing_code: z.string().min(1).max(1_024),
+  pairing_code: z.string().min(6).max(1_024),
 });
 
 const joinSchema = z.object({
@@ -29,11 +55,64 @@ const joinSchema = z.object({
 
 const outboxItemSchema = z.object({
   kind: z.enum(KINDS),
-  body: z.custom<{} | null>((value) => value !== undefined, {
-    message: "Message body is required",
-  }),
+  body: z
+    .custom<{} | null>((value) => value !== undefined, {
+      message: "Message body is required",
+    })
+    .refine(
+      (value) =>
+        Buffer.byteLength(JSON.stringify(value), "utf8") <=
+        MAX_MESSAGE_BODY_BYTES,
+      { message: `Message body must be at most ${MAX_MESSAGE_BODY_BYTES} bytes` },
+    ),
   client_msg_id: z.string().min(1).max(500).optional(),
 });
+
+const presenceSchema = z.object({
+  reclaim_token: z.string().length(48),
+});
+
+const boardCodeSchema = z.object({
+  code: z.string().min(1).max(1_024),
+});
+
+class SlidingWindowLimiter {
+  readonly #attempts = new Map<string, number[]>();
+
+  constructor(readonly limit: number) {}
+
+  allow(key: string, now = Date.now()): boolean {
+    const recent = this.#recent(key, now);
+    if (recent.length >= this.limit) {
+      return false;
+    }
+    recent.push(now);
+    this.#attempts.set(key, recent);
+    return true;
+  }
+
+  blocked(key: string, now = Date.now()): boolean {
+    return this.#recent(key, now).length >= this.limit;
+  }
+
+  record(key: string, now = Date.now()): void {
+    const recent = this.#recent(key, now);
+    recent.push(now);
+    this.#attempts.set(key, recent);
+  }
+
+  #recent(key: string, now: number): number[] {
+    const recent = (this.#attempts.get(key) ?? []).filter(
+      (timestamp) => now - timestamp < RATE_WINDOW_MS,
+    );
+    if (recent.length === 0) {
+      this.#attempts.delete(key);
+    } else {
+      this.#attempts.set(key, recent);
+    }
+    return recent;
+  }
+}
 
 const syncSchema = z.object({
   session_name: z.string().trim().min(1).max(200),
@@ -56,6 +135,62 @@ function sendJson(
   response.end(body);
 }
 
+function staticFilePath(pathname: string): string | undefined {
+  let decodedPath: string;
+  try {
+    decodedPath = decodeURIComponent(pathname);
+  } catch {
+    return undefined;
+  }
+  const relativePath =
+    decodedPath === "/" || decodedPath === "/board"
+      ? "board.html"
+      : decodedPath.replace(/^\/+/, "");
+  if (relativePath.length === 0 || relativePath.includes("\0")) {
+    return undefined;
+  }
+  const candidate = resolve(PUBLIC_DIRECTORY, relativePath);
+  if (!candidate.startsWith(`${PUBLIC_DIRECTORY}${sep}`)) {
+    return undefined;
+  }
+  return candidate;
+}
+
+async function trySendStatic(
+  response: import("node:http").ServerResponse,
+  pathname: string,
+): Promise<boolean> {
+  const path = staticFilePath(pathname);
+  if (path === undefined) {
+    return false;
+  }
+  try {
+    const body = await readFile(path);
+    response.writeHead(200, {
+      "content-type": CONTENT_TYPES[extname(path).toLowerCase()] ?? "application/octet-stream",
+      "content-length": body.length,
+      // Known CSP landmine: board.html still uses inline event handlers and script.
+      "content-security-policy":
+        "default-src 'self'; connect-src 'self'; img-src 'self' data:; " +
+        "script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; " +
+        "font-src 'self'; base-uri 'none'; frame-ancestors 'none'",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+    });
+    response.end(body);
+    return true;
+  } catch (error: unknown) {
+    const code =
+      typeof error === "object" && error !== null && "code" in error
+        ? (error as { code?: unknown }).code
+        : undefined;
+    if (code === "ENOENT" || code === "EISDIR") {
+      return false;
+    }
+    throw error;
+  }
+}
+
 async function readJson(request: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
   let length = 0;
@@ -74,15 +209,7 @@ async function readJson(request: IncomingMessage): Promise<unknown> {
   }
 }
 
-function reclaimToken(request: IncomingMessage, url: URL): string | undefined {
-  const queryToken = url.searchParams.get("reclaim_token");
-  if (queryToken !== null) {
-    return queryToken;
-  }
-  const headerToken = request.headers["x-reclaim-token"];
-  if (typeof headerToken === "string") {
-    return headerToken;
-  }
+function bearerToken(request: IncomingMessage): string | undefined {
   const authorization = request.headers.authorization;
   if (authorization?.startsWith("Bearer ")) {
     return authorization.slice("Bearer ".length);
@@ -90,12 +217,42 @@ function reclaimToken(request: IncomingMessage, url: URL): string | undefined {
   return undefined;
 }
 
+function clientIp(request: IncomingMessage): string {
+  return request.socket?.remoteAddress ?? "unknown";
+}
+
+async function boardPairingCode(request: IncomingMessage): Promise<string> {
+  const codeHeader = request.headers["x-acommune-code"];
+  if (typeof codeHeader === "string" && codeHeader.length > 0) {
+    return boardCodeSchema.shape.code.parse(codeHeader);
+  }
+  const authorization = bearerToken(request);
+  if (authorization !== undefined && authorization.length > 0) {
+    return boardCodeSchema.shape.code.parse(authorization);
+  }
+  try {
+    return boardCodeSchema.parse(await readJson(request)).code;
+  } catch (error: unknown) {
+    if (error instanceof RelayError && error.code === "INVALID_JSON") {
+      throw new RelayError(401, "INVALID_PAIRING_CODE", "Pairing code required");
+    }
+    throw error;
+  }
+}
+
 export function createServer(dependencies: ServerDependencies = {}): Server {
   const store = new RelayStore(
     dependencies.dbPath ?? process.env.RELAY_DB ?? "./data/acommune.sqlite",
   );
-  const notifier = new RoomNotifier();
+  const notifier = dependencies.notifier ?? new RoomNotifier();
   const version = dependencies.version ?? VERSION;
+  const roomCreateLimiter = new SlidingWindowLimiter(
+    dependencies.roomCreateLimitPerMinute ?? 10,
+  );
+  const failedPairingLimiter = new SlidingWindowLimiter(
+    dependencies.failedPairingLimitPerMinute ?? 5,
+  );
+  const roomLimit = dependencies.roomLimit ?? 10_000;
 
   const server = createHttpServer(async (request, response) => {
     try {
@@ -108,10 +265,18 @@ export function createServer(dependencies: ServerDependencies = {}): Server {
       }
 
       if (method === "POST" && url.pathname === "/rooms") {
+        if (!roomCreateLimiter.allow(clientIp(request))) {
+          throw new RelayError(
+            429,
+            "ROOM_CREATE_RATE_LIMITED",
+            "Too many room creation attempts; try again later",
+          );
+        }
         const input = roomSchema.parse(await readJson(request));
         const { created, ...room } = store.createRoom(
           input.name,
           input.pairing_code,
+          roomLimit,
         );
         sendJson(response, created ? 201 : 200, room);
         return;
@@ -119,14 +284,30 @@ export function createServer(dependencies: ServerDependencies = {}): Server {
 
       const joinMatch = /^\/rooms\/([^/]+)\/join$/.exec(url.pathname);
       if (method === "POST" && joinMatch !== null) {
+        const ip = clientIp(request);
+        if (failedPairingLimiter.blocked(ip)) {
+          throw new RelayError(
+            429,
+            "PAIRING_RATE_LIMITED",
+            "Too many failed pairing attempts; try again later",
+          );
+        }
         const roomId = store.resolveRoomId(decodeURIComponent(joinMatch[1]!));
         const input = joinSchema.parse(await readJson(request));
-        const result = store.join(
-          roomId,
-          input.session_name,
-          input.pairing_code,
-          input.reclaim_token,
-        );
+        let result;
+        try {
+          result = store.join(
+            roomId,
+            input.session_name,
+            input.pairing_code,
+            input.reclaim_token,
+          );
+        } catch (error: unknown) {
+          if (error instanceof RelayError && error.code === "INVALID_PAIRING_CODE") {
+            failedPairingLimiter.record(ip);
+          }
+          throw error;
+        }
         notifier.notify(roomId);
         sendJson(response, 200, result);
         return;
@@ -159,8 +340,32 @@ export function createServer(dependencies: ServerDependencies = {}): Server {
         const sent = result.sent;
         let timedOut = false;
         if (result.received.length === 0 && input.wait_seconds > 0) {
-          const notified = await notifier.wait(roomId, input.wait_seconds * 1_000);
-          timedOut = !notified;
+          let waitHandle;
+          try {
+            waitHandle = notifier.wait(roomId, input.wait_seconds * 1_000);
+          } catch (error: unknown) {
+            if (error instanceof WaiterLimitError) {
+              throw new RelayError(
+                503,
+                "LONG_POLL_LIMIT_REACHED",
+                "Too many concurrent long polls",
+              );
+            }
+            throw error;
+          }
+          const cancelWait = (): void => waitHandle.cancel();
+          request.once("aborted", cancelWait);
+          response.once("close", cancelWait);
+          if (request.aborted || response.destroyed) {
+            waitHandle.cancel();
+          }
+          const outcome = await waitHandle.promise;
+          request.off("aborted", cancelWait);
+          response.off("close", cancelWait);
+          if (outcome === "cancelled" || response.destroyed) {
+            return;
+          }
+          timedOut = outcome === "timeout";
           result = store.sync(
             roomId,
             input.session_name,
@@ -186,11 +391,13 @@ export function createServer(dependencies: ServerDependencies = {}): Server {
       }
 
       const presenceMatch = /^\/rooms\/([^/]+)\/presence$/.exec(url.pathname);
-      if (method === "GET" && presenceMatch !== null) {
-        const token = reclaimToken(request, url);
-        if (token === undefined) {
-          throw new RelayError(401, "MISSING_RECLAIM_TOKEN", "Reclaim token required");
-        }
+      if (method === "POST" && presenceMatch !== null) {
+        const headerToken = request.headers["x-reclaim-token"];
+        const token =
+          typeof headerToken === "string"
+            ? presenceSchema.shape.reclaim_token.parse(headerToken)
+            : bearerToken(request) ??
+              presenceSchema.parse(await readJson(request)).reclaim_token;
         const roomId = store.resolveRoomId(
           decodeURIComponent(presenceMatch[1]!),
         );
@@ -202,6 +409,33 @@ export function createServer(dependencies: ServerDependencies = {}): Server {
       if (method === "GET" && verifyMatch !== null) {
         const roomId = store.resolveRoomId(decodeURIComponent(verifyMatch[1]!));
         sendJson(response, 200, store.verify(roomId));
+        return;
+      }
+
+      const boardMatch = /^\/rooms\/([^/]+)\/board$/.exec(url.pathname);
+      if (method === "POST" && boardMatch !== null) {
+        const ip = clientIp(request);
+        if (failedPairingLimiter.blocked(ip)) {
+          throw new RelayError(
+            429,
+            "PAIRING_RATE_LIMITED",
+            "Too many failed pairing attempts; try again later",
+          );
+        }
+        const roomId = store.resolveRoomId(decodeURIComponent(boardMatch[1]!));
+        const pairingCode = await boardPairingCode(request);
+        try {
+          sendJson(response, 200, store.board(roomId, pairingCode));
+        } catch (error: unknown) {
+          if (error instanceof RelayError && error.code === "INVALID_PAIRING_CODE") {
+            failedPairingLimiter.record(ip);
+          }
+          throw error;
+        }
+        return;
+      }
+
+      if (method === "GET" && (await trySendStatic(response, url.pathname))) {
         return;
       }
 

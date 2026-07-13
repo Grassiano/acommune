@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
@@ -10,8 +12,14 @@ import { describe, it } from "node:test";
 
 import type { Message, SyncResult } from "acommune-shared";
 
-import { createServer } from "../src/server.js";
+import { RoomNotifier } from "../src/notifier.js";
+import {
+  MAX_MESSAGE_BODY_BYTES,
+  createServer,
+  type ServerDependencies,
+} from "../src/server.js";
 import { openDatabase } from "../src/sqlite.js";
+import { BOARD_MESSAGE_BYTES_LIMIT } from "../src/store.js";
 
 interface Harness {
   dbPath: string;
@@ -31,6 +39,23 @@ interface JoinResponse {
   cursor: number;
 }
 
+interface BoardResponse {
+  room: string;
+  presence: Array<{
+    session_name: string;
+    last_seen: string;
+    current_claim?: unknown;
+  }>;
+  messages: Array<{
+    seq: number;
+    sender: string;
+    kind: string;
+    body: unknown;
+    ts: string;
+  }>;
+  verified: boolean;
+}
+
 interface JsonResponse<T> {
   status: number;
   body: T;
@@ -42,10 +67,12 @@ interface RequestOptions {
   headers?: Record<string, string>;
 }
 
-async function startHarness(): Promise<Harness> {
+async function startHarness(
+  dependencies: Omit<ServerDependencies, "dbPath"> = {},
+): Promise<Harness> {
   const directory = await mkdtemp(join(tmpdir(), "acommune-test-"));
   const dbPath = join(directory, "relay.sqlite");
-  const server = createServer({ dbPath, version: "test" });
+  const server = createServer({ ...dependencies, dbPath, version: "test" });
   let port: number | undefined;
   let socketPath: string | undefined;
   try {
@@ -118,7 +145,10 @@ async function jsonRequest<T>(
       }) as unknown as IncomingMessage;
       let status = 0;
       const chunks: Buffer[] = [];
-      const response = {
+      const emitter = new EventEmitter();
+      let response: ServerResponse;
+      response = Object.assign(emitter, {
+        destroyed: false,
         writeHead: (code: number) => {
           status = code;
           return response;
@@ -137,7 +167,7 @@ async function jsonRequest<T>(
           }
           return response;
         },
-      } as unknown as ServerResponse;
+      }) as unknown as ServerResponse;
       harness.directServer?.emit("request", request, response);
     });
   }
@@ -175,13 +205,81 @@ async function jsonRequest<T>(
   });
 }
 
-async function createRoom(harness: Harness): Promise<RoomResponse> {
+async function createRoom(
+  harness: Harness,
+  name = "test room",
+  pairingCode = "pair-me",
+): Promise<RoomResponse> {
   const response = await jsonRequest<RoomResponse>(harness, "/rooms", {
     method: "POST",
-    body: JSON.stringify({ name: "test room", pairing_code: "pair-me" }),
+    body: JSON.stringify({ name, pairing_code: pairingCode }),
   });
   assert.equal(response.status, 201);
   return response.body;
+}
+
+async function boardRequest(
+  harness: Harness,
+  room: string,
+  code = "pair-me",
+): Promise<JsonResponse<BoardResponse>> {
+  return jsonRequest<BoardResponse>(
+    harness,
+    `/rooms/${encodeURIComponent(room)}/board`,
+    {
+      method: "POST",
+      headers: { "x-acommune-code": code },
+    },
+  );
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) {
+      throw new Error("Timed out waiting for condition");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function startDisconnectingLongPoll(
+  harness: Harness,
+  path: string,
+  body: string,
+): () => void {
+  if (harness.directServer !== undefined) {
+    const input = Object.assign(Readable.from([Buffer.from(body)]), {
+      method: "POST",
+      url: path,
+      headers: { "content-type": "application/json" },
+    }) as unknown as IncomingMessage;
+    const emitter = new EventEmitter();
+    let response: ServerResponse;
+    response = Object.assign(emitter, {
+      destroyed: false,
+      writeHead: () => response,
+      end: () => response,
+    }) as unknown as ServerResponse;
+    harness.directServer.emit("request", input, response);
+    return () => emitter.emit("close");
+  }
+
+  const request = httpRequest({
+    ...(harness.socketPath === undefined
+      ? { hostname: "127.0.0.1", port: harness.port }
+      : { socketPath: harness.socketPath }),
+    path,
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "content-length": Buffer.byteLength(body),
+    },
+  });
+  request.on("error", () => undefined);
+  request.on("response", (response) => response.resume());
+  request.end(body);
+  return () => request.destroy();
 }
 
 async function joinRoom(
@@ -238,6 +336,96 @@ async function sync(
 }
 
 describe("relay HTTP protocol", () => {
+  it("requires pairing codes of at least six characters", async () => {
+    const harness = await startHarness();
+    try {
+      const response = await jsonRequest<{ error: { code: string } }>(
+        harness,
+        "/rooms",
+        {
+          method: "POST",
+          body: JSON.stringify({ name: "short-code", pairing_code: "12345" }),
+        },
+      );
+      assert.equal(response.status, 400);
+      assert.equal(response.body.error.code, "VALIDATION_ERROR");
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("rate-limits room creation per client IP", async () => {
+    const harness = await startHarness({ roomCreateLimitPerMinute: 2 });
+    try {
+      await createRoom(harness, "rate-one");
+      await createRoom(harness, "rate-two");
+      const limited = await jsonRequest<{ error: { code: string } }>(
+        harness,
+        "/rooms",
+        {
+          method: "POST",
+          body: JSON.stringify({ name: "rate-three", pairing_code: "pair-me" }),
+        },
+      );
+      assert.equal(limited.status, 429);
+      assert.equal(limited.body.error.code, "ROOM_CREATE_RATE_LIMITED");
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("enforces the relay-wide room cap", async () => {
+    const harness = await startHarness({ roomLimit: 1 });
+    try {
+      await createRoom(harness, "only-room");
+      const full = await jsonRequest<{ error: { code: string } }>(
+        harness,
+        "/rooms",
+        {
+          method: "POST",
+          body: JSON.stringify({ name: "one-too-many", pairing_code: "pair-me" }),
+        },
+      );
+      assert.equal(full.status, 507);
+      assert.equal(full.body.error.code, "ROOM_LIMIT_REACHED");
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("stores a unique salt and salted pairing-code hash", async () => {
+    const harness = await startHarness();
+    try {
+      const room = await createRoom(harness);
+      const otherRoom = await createRoom(harness, "second salted room");
+      const database = openDatabase(harness.dbPath);
+      const stored = database
+        .prepare(
+          "SELECT pairing_hash, pairing_salt FROM rooms WHERE room_id = ?",
+        )
+        .get(room.room_id) as
+        | { pairing_hash: string; pairing_salt: string | null }
+        | undefined;
+      const otherStored = database
+        .prepare("SELECT pairing_salt FROM rooms WHERE room_id = ?")
+        .get(otherRoom.room_id) as { pairing_salt: string | null } | undefined;
+      database.close();
+      assert.notEqual(stored, undefined);
+      assert.match(stored?.pairing_salt ?? "", /^[a-f0-9]{32}$/);
+      assert.notEqual(stored?.pairing_salt, otherStored?.pairing_salt);
+      const unsalted = createHash("sha256").update("pair-me").digest("hex");
+      assert.notEqual(stored?.pairing_hash, unsalted);
+      assert.equal(
+        stored?.pairing_hash,
+        createHash("sha256")
+          .update(`${stored?.pairing_salt ?? ""}pair-me`)
+          .digest("hex"),
+      );
+    } finally {
+      await harness.close();
+    }
+  });
+
   it("returns the same room for repeated name and pairing code", async () => {
     const harness = await startHarness();
     try {
@@ -294,6 +482,39 @@ describe("relay HTTP protocol", () => {
         },
       );
       assert.equal(response.status, 401);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("throttles repeated failed board and join pairing attempts", async () => {
+    const harness = await startHarness({ failedPairingLimitPerMinute: 2 });
+    try {
+      const room = await createRoom(harness);
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const wrong = await jsonRequest<{ error: { code: string } }>(
+          harness,
+          `/rooms/${encodeURIComponent(room.name)}/board`,
+          {
+            method: "POST",
+            headers: { "x-acommune-code": "wrong" },
+          },
+        );
+        assert.equal(wrong.status, 401);
+      }
+      const throttled = await jsonRequest<{ error: { code: string } }>(
+        harness,
+        `/rooms/${encodeURIComponent(room.name)}/join`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            session_name: "guesser",
+            pairing_code: "still-wrong",
+          }),
+        },
+      );
+      assert.equal(throttled.status, 429);
+      assert.equal(throttled.body.error.code, "PAIRING_RATE_LIMITED");
     } finally {
       await harness.close();
     }
@@ -364,18 +585,238 @@ describe("relay HTTP protocol", () => {
       assert.deepEqual(message?.body, { task: "shipping" });
       assert.equal(message?.sender, "alice");
 
-      const query = new URLSearchParams({ reclaim_token: alice.reclaim_token });
       const presence = await jsonRequest<{
         sessions: Array<{ session_name: string }>;
       }>(
         harness,
-        `/rooms/${encodeURIComponent(room.name)}/presence?${query.toString()}`,
+        `/rooms/${encodeURIComponent(room.name)}/presence`,
+        {
+          method: "POST",
+          body: JSON.stringify({ reclaim_token: alice.reclaim_token }),
+        },
       );
       assert.equal(presence.status, 200);
       assert.deepEqual(
         presence.body.sessions.map((session) => session.session_name),
         ["alice", "bob"],
       );
+      const queryRejected = await jsonRequest<{ error: { code: string } }>(
+        harness,
+        `/rooms/${encodeURIComponent(room.name)}/presence?reclaim_token=${alice.reclaim_token}`,
+      );
+      assert.equal(queryRejected.status, 404);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("returns an authenticated read-only board state", async () => {
+    const harness = await startHarness();
+    try {
+      const room = await createRoom(harness);
+      const alice = await joinRoom(harness, room.name, "alice");
+      const bob = await joinRoom(harness, room.name, "bob");
+      await sync(harness, room.name, "alice", alice.reclaim_token, {
+        outbox: [
+          { kind: "progress", body: { note: "board route is taking shape" } },
+          { kind: "claim", body: "editing relay/src/server.ts" },
+        ],
+        wait_seconds: 0,
+      });
+
+      const queryOnly = await jsonRequest<{ error: { code: string } }>(
+        harness,
+        `/rooms/${encodeURIComponent(room.name)}/board?code=pair-me`,
+      );
+      assert.equal(queryOnly.status, 404);
+      const postQueryOnly = await jsonRequest<{ error: { code: string } }>(
+        harness,
+        `/rooms/${encodeURIComponent(room.name)}/board?code=pair-me`,
+        { method: "POST" },
+      );
+      assert.equal(postQueryOnly.status, 401);
+
+      const board = await boardRequest(harness, room.name);
+      assert.equal(board.status, 200);
+      assert.equal(board.body.room, room.name);
+      assert.equal(board.body.verified, true);
+      assert.deepEqual(
+        board.body.presence.map((session) => session.session_name),
+        ["alice", "bob"],
+      );
+      assert.equal(
+        board.body.presence.find((session) => session.session_name === "alice")
+          ?.current_claim,
+        "editing relay/src/server.ts",
+      );
+      assert.equal(
+        board.body.messages.some(
+          (message) =>
+            message.sender === "alice" &&
+            message.kind === "progress" &&
+            "note" in (message.body as { note: string }),
+        ),
+        true,
+      );
+      assert.deepEqual(Object.keys(board.body.messages.at(-1) ?? {}).sort(), [
+        "body",
+        "kind",
+        "sender",
+        "seq",
+        "ts",
+      ]);
+
+      const unreadAfterBoard = await sync(
+        harness,
+        room.name,
+        "bob",
+        bob.reclaim_token,
+        { wait_seconds: 0 },
+      );
+      assert.equal(
+        unreadAfterBoard.body.received.some(
+          (message) => message.body === "editing relay/src/server.ts",
+        ),
+        true,
+      );
+
+      const wrong = await jsonRequest<{ error: { code: string } }>(
+        harness,
+        `/rooms/${encodeURIComponent(room.name)}/board`,
+        {
+          method: "POST",
+          headers: { "x-acommune-code": "wrong" },
+        },
+      );
+      assert.equal(wrong.status, 401);
+      assert.equal(wrong.body.error.code, "INVALID_PAIRING_CODE");
+
+      const missing = await jsonRequest<{ error: { code: string } }>(
+        harness,
+        `/rooms/${encodeURIComponent(room.name)}/board`,
+        { method: "POST" },
+      );
+      assert.equal(missing.status, 401);
+
+      const bodyAuthenticated = await jsonRequest<BoardResponse>(
+        harness,
+        `/rooms/${encodeURIComponent(room.name)}/board`,
+        {
+          method: "POST",
+          body: JSON.stringify({ code: "pair-me" }),
+        },
+      );
+      assert.equal(bodyAuthenticated.status, 200);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("clears a current claim after later progress or handoff", async () => {
+    const harness = await startHarness();
+    try {
+      const room = await createRoom(harness);
+      const alice = await joinRoom(harness, room.name, "alice");
+      await sync(harness, room.name, "alice", alice.reclaim_token, {
+        outbox: [{ kind: "claim", body: { file: "relay/src/store.ts" } }],
+        wait_seconds: 0,
+      });
+      const claimed = await boardRequest(harness, room.name);
+      assert.deepEqual(claimed.body.presence[0]?.current_claim, {
+        file: "relay/src/store.ts",
+      });
+
+      await sync(harness, room.name, "alice", alice.reclaim_token, {
+        outbox: [{ kind: "progress", body: "finished the store change" }],
+        wait_seconds: 0,
+      });
+      const progressed = await boardRequest(harness, room.name);
+      assert.equal(
+        Object.hasOwn(progressed.body.presence[0] ?? {}, "current_claim"),
+        false,
+      );
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("caps aggregate board message bytes while keeping the newest messages", async () => {
+    const harness = await startHarness();
+    try {
+      const room = await createRoom(harness);
+      const alice = await joinRoom(harness, room.name, "alice");
+      const bodies = Array.from({ length: 20 }, (_, index) =>
+        `${String(index).padStart(2, "0")}:${"x".repeat(15_000)}`,
+      );
+      const posted = await sync(harness, room.name, "alice", alice.reclaim_token, {
+        outbox: bodies.map((body) => ({ kind: "knowledge", body })),
+        wait_seconds: 0,
+      });
+      assert.equal(posted.status, 200);
+      const state = await boardRequest(harness, room.name);
+      const aggregateBytes = state.body.messages.reduce(
+        (total, message) =>
+          total + Buffer.byteLength(JSON.stringify(message.body), "utf8"),
+        0,
+      );
+      assert.ok(aggregateBytes <= BOARD_MESSAGE_BYTES_LIMIT);
+      assert.ok(state.body.messages.length < bodies.length + 1);
+      assert.equal(
+        state.body.messages.at(-1)?.seq,
+        posted.body.sent.at(-1)?.seq,
+      );
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("rejects coordination message bodies over the per-message byte limit", async () => {
+    const harness = await startHarness();
+    try {
+      const room = await createRoom(harness);
+      const alice = await joinRoom(harness, room.name, "alice");
+      const oversized = await sync(
+        harness,
+        room.name,
+        "alice",
+        alice.reclaim_token,
+        {
+          outbox: [
+            { kind: "knowledge", body: "x".repeat(MAX_MESSAGE_BODY_BYTES) },
+          ],
+          wait_seconds: 0,
+        },
+      );
+      assert.equal(oversized.status, 400);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("memoizes board verification until a message append invalidates it", async () => {
+    const harness = await startHarness();
+    try {
+      const room = await createRoom(harness);
+      const alice = await joinRoom(harness, room.name, "alice");
+      const initial = await boardRequest(harness, room.name);
+      assert.equal(initial.body.verified, true);
+
+      const database = openDatabase(harness.dbPath);
+      database
+        .prepare(
+          "UPDATE messages SET body_json = ? WHERE room_id = ? AND seq = 1",
+        )
+        .run(JSON.stringify({ tampered: true }), room.room_id);
+      database.close();
+
+      const cached = await boardRequest(harness, room.name);
+      assert.equal(cached.body.verified, true);
+      await sync(harness, room.name, "alice", alice.reclaim_token, {
+        outbox: [{ kind: "progress", body: "invalidate verification cache" }],
+        wait_seconds: 0,
+      });
+      const recomputed = await boardRequest(harness, room.name);
+      assert.equal(recomputed.body.verified, false);
     } finally {
       await harness.close();
     }
@@ -535,6 +976,43 @@ describe("relay HTTP protocol", () => {
         ),
         true,
       );
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("bounds long polls and removes a waiter when its client disconnects", async () => {
+    const notifier = new RoomNotifier({ maxPerRoom: 1, maxTotal: 1 });
+    const harness = await startHarness({ notifier });
+    try {
+      const room = await createRoom(harness);
+      const alice = await joinRoom(harness, room.name, "alice");
+      await sync(harness, room.name, "alice", alice.reclaim_token, {
+        wait_seconds: 0,
+      });
+      const requestBody = JSON.stringify({
+        session_name: "alice",
+        reclaim_token: alice.reclaim_token,
+        wait_seconds: 30,
+      });
+      const disconnect = startDisconnectingLongPoll(
+        harness,
+        `/rooms/${encodeURIComponent(room.name)}/sync`,
+        requestBody,
+      );
+      await waitFor(() => notifier.waiterCount === 1);
+
+      const bounded = await sync(
+        harness,
+        room.name,
+        "alice",
+        alice.reclaim_token,
+        { wait_seconds: 1 },
+      );
+      assert.equal(bounded.status, 503);
+
+      disconnect();
+      await waitFor(() => notifier.waiterCount === 0);
     } finally {
       await harness.close();
     }

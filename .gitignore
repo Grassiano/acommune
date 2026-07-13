@@ -4,4 +4,5 @@ dist
 *.log
 *.sqlite
 *.sqlite-*
-~/.acommune
+# Home-directory credentials live outside this repository; ignore accidental local copies.
+.acommune/
