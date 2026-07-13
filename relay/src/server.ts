@@ -143,9 +143,11 @@ function staticFilePath(pathname: string): string | undefined {
     return undefined;
   }
   const relativePath =
-    decodedPath === "/" || decodedPath === "/board"
-      ? "board.html"
-      : decodedPath.replace(/^\/+/, "");
+    decodedPath === "/"
+      ? "index.html"
+      : decodedPath === "/board"
+        ? "board.html"
+        : decodedPath.replace(/^\/+/, "");
   if (relativePath.length === 0 || relativePath.includes("\0")) {
     return undefined;
   }
