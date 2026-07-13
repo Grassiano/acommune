@@ -187,7 +187,9 @@ async function resolveMcpServer(): Promise<string> {
   );
 }
 
-async function readConfig(configPath: string): Promise<{ config: JsonObject; exists: boolean; raw?: string }> {
+async function readConfig(
+  configPath: string,
+): Promise<{ config: JsonObject; exists: boolean; mode?: number }> {
   let raw: string;
   try {
     raw = await readFile(configPath, "utf8");
@@ -207,7 +209,8 @@ async function readConfig(configPath: string): Promise<{ config: JsonObject; exi
   if (!isJsonObject(parsed)) {
     throw new CliError(`Config ${configPath} must contain a JSON object. Nothing was changed.`);
   }
-  return { config: parsed, exists: true, raw };
+  const mode = (await stat(configPath)).mode & 0o777;
+  return { config: parsed, exists: true, mode };
 }
 
 async function writeConfig(
@@ -232,10 +235,16 @@ async function writeConfig(
   const nextConfig: JsonObject = { ...current.config, mcpServers: nextServers };
 
   await mkdir(dirname(configPath), { recursive: true });
-  if (current.exists) await copyFile(configPath, `${configPath}.bak`);
+  if (current.exists) {
+    await copyFile(configPath, `${configPath}.bak`);
+    if (current.mode !== undefined) await chmod(`${configPath}.bak`, current.mode);
+  }
   const temporary = `${configPath}.${process.pid}.tmp`;
   try {
-    await writeFile(temporary, `${JSON.stringify(nextConfig, null, 2)}\n`, "utf8");
+    await writeFile(temporary, `${JSON.stringify(nextConfig, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: current.mode ?? 0o600,
+    });
     await rename(temporary, configPath);
   } catch (error: unknown) {
     throw new CliError(`Could not write config ${configPath}: ${error instanceof Error ? error.message : String(error)}`);

@@ -465,7 +465,11 @@
       document.getElementById('footerRoom').textContent='#'+room;
       var config={mcpServers:{acommune:{command:'node',args:['/absolute/path/to/acommune/mcp/dist/server.js'],env:{RELAY_URL:window.location.origin}}}};
       var snippet=JSON.stringify(config,null,2);
-      function shellArg(value){return /^[A-Za-z0-9_./:@-]+$/.test(value)?value:"'"+value.replace(/'/g,"'\\"'\\"'")+"'";}
+      function shellArg(value){
+        if(/^[A-Za-z0-9_./:@-]+$/.test(value))return value;
+        var escapedQuote=String.fromCharCode(39,34,39,34,39);
+        return "'"+value.replace(/'/g,escapedQuote)+"'";
+      }
       var command='npx acommune join '+shellArg(room)+' --code '+shellArg(code)+' --relay '+shellArg(window.location.origin);
       var inviteCommand=document.getElementById('inviteCommand');
       inviteCommand.textContent=command;
