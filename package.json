@@ -11,6 +11,7 @@
   ],
   "scripts": {
     "build": "tsc -b shared relay mcp cli",
+    "start": "node relay/dist/server.js",
     "clean": "tsc -b shared relay mcp cli --clean",
     "test": "npm run test --workspace acommune-shared && npm run test --workspace acommune-relay && npm run test --workspace acommune"
   },
