@@ -425,8 +425,19 @@
       return {target:'next person',task:readableValue(body),explicit:false};
     }
 
+    function bodyText(kind,body){
+      if(typeof body==='string')return body;
+      if(body!==null&&typeof body==='object'){
+        if(typeof body.summary==='string')return body.summary;
+        if(typeof body.body==='string')return body.body;
+        if(typeof body.text==='string')return body.text;
+        return JSON.stringify(body);
+      }
+      return readableValue(body);
+    }
+
     function messageText(message){
-      var text=readableValue(message.body);
+      var text=bodyText(message.kind,message.body);
       if(message.kind==='question'&&text&&!/[?？]\s*$/.test(text))return text+'?';
       if(message.kind==='handoff'){
         var info=handoffInfo(message.body);
@@ -552,11 +563,24 @@
       var bubble=document.createElement('div');
       bubble.className='bubble';
       if(message.kind==='claim'){
-        bubble.append(document.createTextNode('taking '));
-        var mono=document.createElement('span');
-        mono.className='mono';
-        mono.textContent=messageText(message).replace(/^(?:taking|editing)\s+/i,'');
-        bubble.append(mono);
+        var structured=message.body&&typeof message.body==='object'&&!Array.isArray(message.body)&&typeof message.body.summary==='string';
+        var files=structured&&Array.isArray(message.body.files)?message.body.files.filter(function(file){return typeof file==='string';}):[];
+        if(structured){
+          bubble.append(document.createTextNode(bodyText(message.kind,message.body)));
+          if(files.length>0){
+            bubble.append(document.createTextNode(' · '));
+            var filesMono=document.createElement('span');
+            filesMono.className='mono';
+            filesMono.textContent=files.map(function(file){return bodyText(message.kind,file);}).join(', ');
+            bubble.append(filesMono);
+          }
+        }else{
+          bubble.append(document.createTextNode('taking '));
+          var mono=document.createElement('span');
+          mono.className='mono';
+          mono.textContent=bodyText(message.kind,message.body).replace(/^(?:taking|editing)\s+/i,'');
+          bubble.append(mono);
+        }
       }else{
         bubble.textContent=messageText(message);
       }
