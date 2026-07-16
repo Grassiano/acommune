@@ -5,11 +5,17 @@ export const KINDS = [
   "answer",
   "knowledge",
   "handoff",
+  "task_update",
   "join",
   "heartbeat",
 ] as const;
 
 export type Kind = (typeof KINDS)[number];
+
+export interface TaskUpdateBody {
+  task_seq: number;
+  status: "claimed" | "done" | "dropped";
+}
 
 export interface Room {
   room_id: string;
@@ -41,4 +47,3 @@ export interface SyncResult {
   cursor: number;
   status: "ready" | "timeout" | "empty";
 }
-

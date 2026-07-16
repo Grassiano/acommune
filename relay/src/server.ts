@@ -1,10 +1,11 @@
 #!/usr/bin/env node
+import { randomBytes } from "node:crypto";
 import { createServer as createHttpServer, type IncomingMessage, type Server } from "node:http";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, extname, resolve, sep } from "node:path";
 
-import { KINDS, type SyncResult } from "acommune-shared";
+import { KINDS, type Kind, type SyncResult } from "acommune-shared";
 import { z, ZodError } from "zod";
 
 import { RoomNotifier, WaiterLimitError } from "./notifier.js";
@@ -44,7 +45,11 @@ const RATE_WINDOW_MS = 60_000;
 
 const roomSchema = z.object({
   name: z.string().trim().min(1).max(200),
-  pairing_code: z.string().min(6).max(1_024),
+  pairing_code: z.string().min(6).max(1_024).optional(),
+});
+
+const rotateCodeSchema = z.object({
+  new_code: z.string().min(12).max(1_024),
 });
 
 const joinSchema = z.object({
@@ -242,6 +247,34 @@ async function boardPairingCode(request: IncomingMessage): Promise<string> {
   }
 }
 
+function pairingCodeHeader(request: IncomingMessage): string {
+  const code = request.headers["x-acommune-code"];
+  if (typeof code !== "string" || code.length === 0) {
+    throw new RelayError(401, "INVALID_PAIRING_CODE", "Pairing code required");
+  }
+  return boardCodeSchema.shape.code.parse(code);
+}
+
+function integerQuery(
+  value: string | null,
+  defaultValue: number,
+  options: { minimum: number; maximum?: number },
+): number {
+  if (value === null) {
+    return defaultValue;
+  }
+  if (!/^\d+$/.test(value)) {
+    throw new RelayError(400, "INVALID_QUERY", "Invalid numeric query parameter");
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < options.minimum) {
+    throw new RelayError(400, "INVALID_QUERY", "Invalid numeric query parameter");
+  }
+  return options.maximum === undefined
+    ? parsed
+    : Math.min(parsed, options.maximum);
+}
+
 export function createServer(dependencies: ServerDependencies = {}): Server {
   const store = new RelayStore(
     dependencies.dbPath ?? process.env.RELAY_DB ?? "./data/acommune.sqlite",
@@ -275,12 +308,156 @@ export function createServer(dependencies: ServerDependencies = {}): Server {
           );
         }
         const input = roomSchema.parse(await readJson(request));
+        const generatedPairingCode =
+          input.pairing_code === undefined
+            ? randomBytes(16).toString("hex")
+            : undefined;
+        const pairingCode = input.pairing_code ?? generatedPairingCode;
+        if (pairingCode === undefined) {
+          throw new RelayError(500, "INTERNAL_ERROR", "Pairing code generation failed");
+        }
         const { created, ...room } = store.createRoom(
           input.name,
-          input.pairing_code,
+          pairingCode,
           roomLimit,
         );
-        sendJson(response, created ? 201 : 200, room);
+        sendJson(
+          response,
+          created ? 201 : 200,
+          generatedPairingCode === undefined
+            ? room
+            : { ...room, pairing_code: generatedPairingCode },
+        );
+        return;
+      }
+
+      const messagesMatch = /^\/rooms\/([^/]+)\/messages$/.exec(url.pathname);
+      if (method === "GET" && messagesMatch !== null) {
+        const ip = clientIp(request);
+        if (failedPairingLimiter.blocked(ip)) {
+          throw new RelayError(
+            429,
+            "PAIRING_RATE_LIMITED",
+            "Too many failed pairing attempts; try again later",
+          );
+        }
+        const roomId = store.resolveRoomId(decodeURIComponent(messagesMatch[1]!));
+        const pairingCode = pairingCodeHeader(request);
+        const afterSequence = integerQuery(
+          url.searchParams.get("after_seq"),
+          0,
+          { minimum: 0 },
+        );
+        const limit = integerQuery(url.searchParams.get("limit"), 100, {
+          minimum: 1,
+          maximum: 500,
+        });
+        const kindsValue = url.searchParams.get("kinds");
+        const knownKinds = new Set<string>(KINDS);
+        const kinds: Kind[] | undefined =
+          kindsValue === null
+            ? undefined
+            : [
+                ...new Set(
+                  kindsValue
+                    .split(",")
+                    .filter((kind): kind is Kind => knownKinds.has(kind)),
+                ),
+              ];
+        try {
+          sendJson(
+            response,
+            200,
+            store.readMessages(
+              roomId,
+              pairingCode,
+              afterSequence,
+              kinds,
+              limit,
+            ),
+          );
+        } catch (error: unknown) {
+          if (error instanceof RelayError && error.code === "INVALID_PAIRING_CODE") {
+            failedPairingLimiter.record(ip);
+          }
+          throw error;
+        }
+        return;
+      }
+
+      const digestMatch = /^\/rooms\/([^/]+)\/digest$/.exec(url.pathname);
+      if (method === "GET" && digestMatch !== null) {
+        const ip = clientIp(request);
+        if (failedPairingLimiter.blocked(ip)) {
+          throw new RelayError(
+            429,
+            "PAIRING_RATE_LIMITED",
+            "Too many failed pairing attempts; try again later",
+          );
+        }
+        const roomId = store.resolveRoomId(decodeURIComponent(digestMatch[1]!));
+        const pairingCode = pairingCodeHeader(request);
+        try {
+          sendJson(response, 200, store.digest(roomId, pairingCode));
+        } catch (error: unknown) {
+          if (error instanceof RelayError && error.code === "INVALID_PAIRING_CODE") {
+            failedPairingLimiter.record(ip);
+          }
+          throw error;
+        }
+        return;
+      }
+
+      const claimsMatch = /^\/rooms\/([^/]+)\/claims$/.exec(url.pathname);
+      if (method === "GET" && claimsMatch !== null) {
+        const ip = clientIp(request);
+        if (failedPairingLimiter.blocked(ip)) {
+          throw new RelayError(
+            429,
+            "PAIRING_RATE_LIMITED",
+            "Too many failed pairing attempts; try again later",
+          );
+        }
+        const roomId = store.resolveRoomId(decodeURIComponent(claimsMatch[1]!));
+        const pairingCode = pairingCodeHeader(request);
+        const file = z.string().min(1).max(4_096).parse(url.searchParams.get("file"));
+        try {
+          sendJson(response, 200, store.claims(roomId, pairingCode, file));
+        } catch (error: unknown) {
+          if (error instanceof RelayError && error.code === "INVALID_PAIRING_CODE") {
+            failedPairingLimiter.record(ip);
+          }
+          throw error;
+        }
+        return;
+      }
+
+      const rotateCodeMatch = /^\/rooms\/([^/]+)\/rotate-code$/.exec(
+        url.pathname,
+      );
+      if (method === "POST" && rotateCodeMatch !== null) {
+        const ip = clientIp(request);
+        if (failedPairingLimiter.blocked(ip)) {
+          throw new RelayError(
+            429,
+            "PAIRING_RATE_LIMITED",
+            "Too many failed pairing attempts; try again later",
+          );
+        }
+        const roomId = store.resolveRoomId(
+          decodeURIComponent(rotateCodeMatch[1]!),
+        );
+        const currentCode = pairingCodeHeader(request);
+        const input = rotateCodeSchema.parse(await readJson(request));
+        try {
+          store.rotateCode(roomId, currentCode, input.new_code);
+          sendJson(response, 200, { ok: true });
+        } catch (error: unknown) {
+          if (error instanceof RelayError && error.code === "INVALID_PAIRING_CODE") {
+            failedPairingLimiter.record(ip);
+          }
+          throw error;
+        }
         return;
       }
 

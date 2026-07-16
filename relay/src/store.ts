@@ -58,6 +58,49 @@ export interface BoardState {
 }
 
 export const BOARD_MESSAGE_BYTES_LIMIT = 256 * 1_024;
+export const LIST_RESPONSE_BYTES_LIMIT = BOARD_MESSAGE_BYTES_LIMIT;
+export const CLAIM_TTL_MS = 15 * 60 * 1_000;
+
+export interface StatelessMessagesState {
+  messages: Message[];
+  last_seq: number;
+}
+
+export type TaskState = "open" | "claimed" | "done" | "dropped";
+
+export interface DigestSession {
+  name: string;
+  last_seen: string;
+  active_claims: string[];
+}
+
+export interface DigestTask {
+  id: number;
+  summary: string;
+  to: string | null;
+  state: TaskState;
+  age_seconds: number;
+}
+
+export interface RoomDigest {
+  room: string;
+  verified: boolean;
+  last_seq: number;
+  sessions: DigestSession[];
+  open_tasks: DigestTask[];
+}
+
+export interface ActiveClaim {
+  session_name: string;
+  path: string;
+  claim_seq: number;
+  refreshed_at: string;
+  expires_at: string;
+}
+
+export interface ClaimLookupState {
+  claims: ActiveClaim[];
+}
 
 interface RoomRow {
   room_id: string;
@@ -110,6 +153,31 @@ interface BoardPresenceRow {
   current_claim_json: string | null;
 }
 
+interface LastSequenceRow {
+  last_seq: number;
+}
+
+interface SessionDigestRow {
+  session_name: string;
+  last_seen: string;
+}
+
+interface ClaimRow {
+  session_name: string;
+  path: string;
+  claim_seq: number;
+  refreshed_at: string;
+  expires_at: string;
+}
+
+interface TaskRow {
+  task_seq: number;
+  summary: string;
+  to_name: string | null;
+  state: TaskState;
+  created_at: string;
+}
+
 interface CountRow {
   count: number;
 }
@@ -155,6 +223,64 @@ function rowToMessage(row: MessageRow): Message {
   return row.client_msg_id === null
     ? base
     : { ...base, client_msg_id: row.client_msg_id };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function claimPaths(body: unknown): string[] {
+  if (typeof body === "string") {
+    return body.length === 0 ? [] : [body];
+  }
+  if (!isRecord(body)) {
+    return [];
+  }
+  const files = body.files;
+  if (Array.isArray(files)) {
+    return [
+      ...new Set(
+        files.filter(
+          (file): file is string => typeof file === "string" && file.length > 0,
+        ),
+      ),
+    ];
+  }
+  return typeof body.file === "string" && body.file.length > 0
+    ? [body.file]
+    : [];
+}
+
+function handoffDetails(body: unknown): { summary: string; to: string | null } {
+  if (typeof body === "string") {
+    return { summary: body, to: null };
+  }
+  if (!isRecord(body)) {
+    return { summary: "", to: null };
+  }
+  return {
+    summary: typeof body.summary === "string" ? body.summary : "",
+    to: typeof body.to === "string" ? body.to : null,
+  };
+}
+
+function taskUpdate(
+  body: unknown,
+): { taskSequence: number; status: Exclude<TaskState, "open"> } | undefined {
+  if (!isRecord(body) || !Number.isInteger(body.task_seq)) {
+    return undefined;
+  }
+  if (
+    body.status !== "claimed" &&
+    body.status !== "done" &&
+    body.status !== "dropped"
+  ) {
+    return undefined;
+  }
+  return {
+    taskSequence: body.task_seq as number,
+    status: body.status,
+  };
 }
 
 export class RelayStore {
@@ -211,6 +337,31 @@ export class RelayStore {
         last_seen TEXT NOT NULL,
         PRIMARY KEY(room_id, session_name)
       );
+      CREATE TABLE IF NOT EXISTS derived_tasks (
+        room_id TEXT NOT NULL REFERENCES rooms(room_id) ON DELETE CASCADE,
+        task_seq INTEGER NOT NULL,
+        summary TEXT NOT NULL,
+        to_name TEXT,
+        state TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(room_id, task_seq)
+      );
+      CREATE INDEX IF NOT EXISTS derived_tasks_room_state
+        ON derived_tasks(room_id, state, task_seq);
+      CREATE TABLE IF NOT EXISTS derived_claims (
+        room_id TEXT NOT NULL REFERENCES rooms(room_id) ON DELETE CASCADE,
+        session_name TEXT NOT NULL,
+        path TEXT NOT NULL,
+        claim_seq INTEGER NOT NULL,
+        refreshed_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        PRIMARY KEY(room_id, session_name, path)
+      );
+      CREATE INDEX IF NOT EXISTS derived_claims_path
+        ON derived_claims(room_id, path, expires_at);
+      CREATE INDEX IF NOT EXISTS derived_claims_session
+        ON derived_claims(room_id, session_name, expires_at, claim_seq);
     `);
     const roomColumns = this.#database
       .prepare("PRAGMA table_info(rooms)")
@@ -218,6 +369,14 @@ export class RelayStore {
     if (!roomColumns.some((column) => column.name === "pairing_salt")) {
       this.#database.exec("ALTER TABLE rooms ADD COLUMN pairing_salt TEXT");
     }
+    this.#database.transaction(() => {
+      const rooms = this.#database
+        .prepare("SELECT room_id FROM rooms")
+        .all() as RoomIdRow[];
+      for (const room of rooms) {
+        this.#rebuildDerivedState(room.room_id);
+      }
+    })();
   }
 
   close(): void {
@@ -463,6 +622,203 @@ export class RelayStore {
     return result;
   }
 
+  readMessages(
+    roomId: string,
+    pairingCode: string,
+    afterSequence: number,
+    kinds: readonly Kind[] | undefined,
+    limit: number,
+  ): StatelessMessagesState {
+    this.#authenticatePairingCode(roomId, pairingCode);
+    const kindClause =
+      kinds === undefined
+        ? ""
+        : kinds.length === 0
+          ? " AND 0"
+          : ` AND kind IN (${kinds.map(() => "?").join(", ")})`;
+    const rows = this.#database
+      .prepare(
+        `SELECT seq, prev_hash, hash, sender, kind, body_json, created_at,
+                client_msg_id
+           FROM messages
+          WHERE room_id = ? AND seq > ?${kindClause}
+          ORDER BY seq ASC
+          LIMIT ?`,
+      )
+      .all(roomId, afterSequence, ...(kinds ?? []), limit) as MessageRow[];
+    const messages: Message[] = [];
+    let aggregateBytes = 0;
+    for (const row of rows) {
+      const nextBytes = Buffer.byteLength(row.body_json, "utf8");
+      if (aggregateBytes + nextBytes > LIST_RESPONSE_BYTES_LIMIT) {
+        break;
+      }
+      messages.push(rowToMessage(row));
+      aggregateBytes += nextBytes;
+    }
+    if (messages.length > 0) {
+      return { messages, last_seq: messages.at(-1)?.seq ?? afterSequence };
+    }
+    const latest = this.#database
+      .prepare(
+        "SELECT next_seq - 1 AS last_seq FROM room_seq WHERE room_id = ?",
+      )
+      .get(roomId) as LastSequenceRow;
+    return { messages, last_seq: Math.max(afterSequence, latest.last_seq) };
+  }
+
+  digest(
+    roomId: string,
+    pairingCode: string,
+    now = Date.now(),
+  ): RoomDigest {
+    const room = this.#authenticatePairingCode(roomId, pairingCode);
+    const nowIso = new Date(now).toISOString();
+    const sessionRows = this.#database
+      .prepare(
+        `SELECT session_name, last_seen
+           FROM sessions
+          WHERE room_id = ?
+          ORDER BY session_name
+          LIMIT 5000`,
+      )
+      .all(roomId) as SessionDigestRow[];
+    const claimRows = this.#database
+      .prepare(
+        `SELECT session_name, path, claim_seq, refreshed_at, expires_at
+           FROM derived_claims
+          WHERE room_id = ? AND expires_at > ?
+          ORDER BY session_name, claim_seq DESC, path
+          LIMIT 5000`,
+      )
+      .all(roomId, nowIso) as ClaimRow[];
+    const claimsBySession = new Map<string, string[]>();
+    for (const claim of claimRows) {
+      const paths = claimsBySession.get(claim.session_name) ?? [];
+      paths.push(claim.path);
+      claimsBySession.set(claim.session_name, paths);
+    }
+
+    const sessions: DigestSession[] = [];
+    let aggregateBytes = 0;
+    for (const session of sessionRows) {
+      const entry: DigestSession = {
+        name: session.session_name,
+        last_seen: session.last_seen,
+        active_claims: claimsBySession.get(session.session_name) ?? [],
+      };
+      const nextBytes = Buffer.byteLength(JSON.stringify(entry), "utf8");
+      if (aggregateBytes + nextBytes > LIST_RESPONSE_BYTES_LIMIT) {
+        break;
+      }
+      sessions.push(entry);
+      aggregateBytes += nextBytes;
+    }
+
+    const taskRows = this.#database
+      .prepare(
+        `SELECT task_seq, summary, to_name, state, created_at
+           FROM derived_tasks
+          WHERE room_id = ? AND state IN ('open', 'claimed')
+          ORDER BY task_seq
+          LIMIT 5000`,
+      )
+      .all(roomId) as TaskRow[];
+    const openTasks: DigestTask[] = [];
+    for (const task of taskRows) {
+      const createdAt = Date.parse(task.created_at);
+      const entry: DigestTask = {
+        id: task.task_seq,
+        summary: task.summary,
+        to: task.to_name,
+        state: task.state,
+        age_seconds: Number.isNaN(createdAt)
+          ? 0
+          : Math.max(0, Math.floor((now - createdAt) / 1_000)),
+      };
+      const nextBytes = Buffer.byteLength(JSON.stringify(entry), "utf8");
+      if (aggregateBytes + nextBytes > LIST_RESPONSE_BYTES_LIMIT) {
+        break;
+      }
+      openTasks.push(entry);
+      aggregateBytes += nextBytes;
+    }
+    const latest = this.#database
+      .prepare(
+        "SELECT next_seq - 1 AS last_seq FROM room_seq WHERE room_id = ?",
+      )
+      .get(roomId) as LastSequenceRow;
+    return {
+      room: room.name,
+      verified: this.#cachedVerification(roomId).ok,
+      last_seq: latest.last_seq,
+      sessions,
+      open_tasks: openTasks,
+    };
+  }
+
+  claims(
+    roomId: string,
+    pairingCode: string,
+    file: string,
+    now = Date.now(),
+  ): ClaimLookupState {
+    this.#authenticatePairingCode(roomId, pairingCode);
+    const candidates = new Set<string>([file]);
+    for (let index = file.indexOf("/"); index >= 0; index = file.indexOf("/", index + 1)) {
+      candidates.add(file.slice(0, index + 1));
+    }
+    const exactPaths = [...candidates];
+    const descendantClause = file.endsWith("/")
+      ? " OR (path >= ? AND path < ?)"
+      : "";
+    const upperBound = `${file}\uffff`;
+    const rows = this.#database
+      .prepare(
+        `SELECT session_name, path, claim_seq, refreshed_at, expires_at
+           FROM derived_claims
+          WHERE room_id = ?
+            AND expires_at > ?
+            AND (path IN (${exactPaths.map(() => "?").join(", ")})${descendantClause})
+          ORDER BY claim_seq DESC, session_name, path
+          LIMIT 500`,
+      )
+      .all(
+        roomId,
+        new Date(now).toISOString(),
+        ...exactPaths,
+        ...(file.endsWith("/") ? [file, upperBound] : []),
+      ) as ClaimRow[];
+    const claims: ActiveClaim[] = [];
+    let aggregateBytes = 0;
+    for (const row of rows) {
+      const entry: ActiveClaim = { ...row };
+      const nextBytes = Buffer.byteLength(JSON.stringify(entry), "utf8");
+      if (aggregateBytes + nextBytes > LIST_RESPONSE_BYTES_LIMIT) {
+        break;
+      }
+      claims.push(entry);
+      aggregateBytes += nextBytes;
+    }
+    return { claims };
+  }
+
+  rotateCode(roomId: string, currentCode: string, newCode: string): void {
+    this.#database.transaction(() => {
+      this.#authenticatePairingCode(roomId, currentCode);
+      const salt = randomBytes(16).toString("hex");
+      this.#database
+        .prepare(
+          "UPDATE rooms SET pairing_hash = ?, pairing_salt = ? WHERE room_id = ?",
+        )
+        .run(sha256(salt + newCode), salt, roomId);
+    })();
+  }
+
+  rebuildDerivedState(roomId: string): void {
+    this.#database.transaction(() => this.#rebuildDerivedState(roomId))();
+  }
+
   board(roomId: string, pairingCode: string): BoardState {
     const room = this.#authenticatePairingCode(roomId, pairingCode);
     const cutoff = new Date(Date.now() - 30 * 60 * 1_000).toISOString();
@@ -472,7 +828,18 @@ export class RelayStore {
       .prepare(
         `SELECT s.session_name, s.last_seen,
                 (
-                  SELECT CASE WHEN m.kind = 'claim' THEN m.body_json ELSE NULL END
+                  SELECT CASE
+                           WHEN m.kind = 'claim' AND EXISTS (
+                             SELECT 1
+                               FROM derived_claims AS c
+                              WHERE c.room_id = m.room_id
+                                AND c.session_name = m.sender
+                                AND c.claim_seq = m.seq
+                                AND c.expires_at > ?
+                           )
+                           THEN m.body_json
+                           ELSE NULL
+                         END
                     FROM messages AS m
                    WHERE m.room_id = s.room_id
                      AND m.sender = s.session_name
@@ -484,7 +851,7 @@ export class RelayStore {
           WHERE s.room_id = ? AND s.last_seen >= ?
           ORDER BY s.session_name`,
       )
-      .all(roomId, cutoff) as BoardPresenceRow[];
+      .all(new Date().toISOString(), roomId, cutoff) as BoardPresenceRow[];
     const presence = presenceRows.map((entry): BoardPresenceEntry => {
       const base = {
         session_name: entry.session_name,
@@ -649,8 +1016,110 @@ export class RelayStore {
       body,
       ts: createdAt,
     };
-    return clientMsgId === undefined
+    const message = clientMsgId === undefined
       ? base
       : { ...base, client_msg_id: clientMsgId };
+    this.#applyDerivedMessage(roomId, message);
+    return message;
+  }
+
+  #rebuildDerivedState(roomId: string): void {
+    const room = this.#database
+      .prepare("SELECT 1 FROM rooms WHERE room_id = ?")
+      .get(roomId);
+    if (room === undefined) {
+      throw new RelayError(404, "ROOM_NOT_FOUND", "Room not found");
+    }
+    this.#database
+      .prepare("DELETE FROM derived_claims WHERE room_id = ?")
+      .run(roomId);
+    this.#database
+      .prepare("DELETE FROM derived_tasks WHERE room_id = ?")
+      .run(roomId);
+    const rows = this.#database
+      .prepare(
+        `SELECT seq, prev_hash, hash, sender, kind, body_json, created_at,
+                client_msg_id
+           FROM messages
+          WHERE room_id = ?
+          ORDER BY seq`,
+      )
+      .all(roomId) as MessageRow[];
+    for (const row of rows) {
+      this.#applyDerivedMessage(roomId, rowToMessage(row));
+    }
+  }
+
+  #applyDerivedMessage(roomId: string, message: Message): void {
+    if (message.kind === "handoff") {
+      const details = handoffDetails(message.body);
+      this.#database
+        .prepare(
+          `INSERT OR IGNORE INTO derived_tasks(
+             room_id, task_seq, summary, to_name, state, created_at, updated_at
+           ) VALUES (?, ?, ?, ?, 'open', ?, ?)`,
+        )
+        .run(
+          roomId,
+          message.seq,
+          details.summary,
+          details.to,
+          message.ts,
+          message.ts,
+        );
+      return;
+    }
+
+    if (message.kind === "task_update") {
+      const update = taskUpdate(message.body);
+      if (update === undefined) {
+        return;
+      }
+      const validPriorState =
+        update.status === "claimed" ? "open" : "claimed";
+      this.#database
+        .prepare(
+          `UPDATE derived_tasks
+              SET state = ?, updated_at = ?
+            WHERE room_id = ? AND task_seq = ? AND state = ?`,
+        )
+        .run(
+          update.status,
+          message.ts,
+          roomId,
+          update.taskSequence,
+          validPriorState,
+        );
+      return;
+    }
+
+    if (message.kind !== "claim") {
+      return;
+    }
+    const refreshedAt = message.ts;
+    const timestamp = Date.parse(refreshedAt);
+    const expiresAt = new Date(
+      (Number.isNaN(timestamp) ? 0 : timestamp) + CLAIM_TTL_MS,
+    ).toISOString();
+    for (const path of claimPaths(message.body)) {
+      this.#database
+        .prepare(
+          `INSERT INTO derived_claims(
+             room_id, session_name, path, claim_seq, refreshed_at, expires_at
+           ) VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(room_id, session_name, path) DO UPDATE SET
+             claim_seq = excluded.claim_seq,
+             refreshed_at = excluded.refreshed_at,
+             expires_at = excluded.expires_at`,
+        )
+        .run(
+          roomId,
+          message.sender,
+          path,
+          message.seq,
+          refreshedAt,
+          expiresAt,
+        );
+    }
   }
 }

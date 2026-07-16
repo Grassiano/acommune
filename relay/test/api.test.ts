@@ -19,7 +19,7 @@ import {
   type ServerDependencies,
 } from "../src/server.js";
 import { openDatabase } from "../src/sqlite.js";
-import { BOARD_MESSAGE_BYTES_LIMIT } from "../src/store.js";
+import { BOARD_MESSAGE_BYTES_LIMIT, RelayStore } from "../src/store.js";
 
 interface Harness {
   dbPath: string;
@@ -1013,6 +1013,383 @@ describe("relay HTTP protocol", () => {
 
       disconnect();
       await waitFor(() => notifier.waiterCount === 0);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("reads messages statelessly without advancing a session cursor", async () => {
+    const harness = await startHarness();
+    try {
+      const room = await createRoom(harness);
+      const alice = await joinRoom(harness, room.name, "alice");
+      const bob = await joinRoom(harness, room.name, "bob");
+      const initial = await sync(harness, room.name, "bob", bob.reclaim_token, {
+        wait_seconds: 0,
+      });
+      await sync(harness, room.name, "alice", alice.reclaim_token, {
+        outbox: [
+          { kind: "knowledge", body: "stateless fact" },
+          { kind: "answer", body: "stateless answer" },
+        ],
+        wait_seconds: 0,
+      });
+
+      const path = `/rooms/${encodeURIComponent(room.name)}/messages?after_seq=${initial.body.cursor}`;
+      const first = await jsonRequest<{
+        messages: Message[];
+        last_seq: number;
+      }>(harness, path, { headers: { "x-acommune-code": "pair-me" } });
+      const second = await jsonRequest<{
+        messages: Message[];
+        last_seq: number;
+      }>(harness, path, { headers: { "x-acommune-code": "pair-me" } });
+      assert.equal(first.status, 200);
+      assert.deepEqual(second.body, first.body);
+      assert.deepEqual(
+        first.body.messages.map((message) => message.body),
+        ["stateless fact", "stateless answer"],
+      );
+
+      const unread = await sync(harness, room.name, "bob", bob.reclaim_token, {
+        wait_seconds: 0,
+      });
+      assert.deepEqual(
+        unread.body.received.map((message) => message.body),
+        ["stateless fact", "stateless answer"],
+      );
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("filters stateless messages by known kinds and ignores unknown kinds", async () => {
+    const harness = await startHarness();
+    try {
+      const room = await createRoom(harness);
+      const alice = await joinRoom(harness, room.name, "alice");
+      await sync(harness, room.name, "alice", alice.reclaim_token, {
+        outbox: [
+          { kind: "knowledge", body: "keep" },
+          { kind: "answer", body: "drop" },
+        ],
+        wait_seconds: 0,
+      });
+      const filtered = await jsonRequest<{ messages: Message[] }>(
+        harness,
+        `/rooms/${encodeURIComponent(room.name)}/messages?kinds=unknown,knowledge&limit=999`,
+        { headers: { "x-acommune-code": "pair-me" } },
+      );
+      assert.equal(filtered.status, 200);
+      assert.deepEqual(
+        filtered.body.messages.map((message) => message.kind),
+        ["knowledge"],
+      );
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("folds tasks open to claimed to done and ignores invalid transitions", async () => {
+    const harness = await startHarness();
+    try {
+      const room = await createRoom(harness);
+      const alice = await joinRoom(harness, room.name, "alice");
+      const handoff = await sync(harness, room.name, "alice", alice.reclaim_token, {
+        outbox: [
+          {
+            kind: "handoff",
+            body: { summary: "finish relay foundation", to: "bob" },
+          },
+        ],
+        wait_seconds: 0,
+      });
+      const taskSequence = handoff.body.sent[0]?.seq;
+      assert.equal(typeof taskSequence, "number");
+
+      await sync(harness, room.name, "alice", alice.reclaim_token, {
+        outbox: [
+          { kind: "task_update", body: { task_seq: taskSequence, status: "done" } },
+          { kind: "task_update", body: { task_seq: 999_999, status: "claimed" } },
+        ],
+        wait_seconds: 0,
+      });
+      const stillOpen = await jsonRequest<{
+        open_tasks: Array<{ id: number; state: string; summary: string; to: string | null }>;
+      }>(harness, `/rooms/${encodeURIComponent(room.name)}/digest`, {
+        headers: { "x-acommune-code": "pair-me" },
+      });
+      assert.deepEqual(stillOpen.body.open_tasks, [
+        {
+          id: taskSequence,
+          summary: "finish relay foundation",
+          to: "bob",
+          state: "open",
+          age_seconds: 0,
+        },
+      ]);
+
+      await sync(harness, room.name, "alice", alice.reclaim_token, {
+        outbox: [
+          { kind: "task_update", body: { task_seq: taskSequence, status: "claimed" } },
+        ],
+        wait_seconds: 0,
+      });
+      const claimed = await jsonRequest<{
+        open_tasks: Array<{ id: number; state: string }>;
+      }>(harness, `/rooms/${encodeURIComponent(room.name)}/digest`, {
+        headers: { "x-acommune-code": "pair-me" },
+      });
+      assert.equal(claimed.body.open_tasks[0]?.state, "claimed");
+
+      await sync(harness, room.name, "alice", alice.reclaim_token, {
+        outbox: [
+          { kind: "task_update", body: { task_seq: taskSequence, status: "done" } },
+        ],
+        wait_seconds: 0,
+      });
+      const completed = await jsonRequest<{ open_tasks: unknown[] }>(
+        harness,
+        `/rooms/${encodeURIComponent(room.name)}/digest`,
+        { headers: { "x-acommune-code": "pair-me" } },
+      );
+      assert.deepEqual(completed.body.open_tasks, []);
+
+      const database = openDatabase(harness.dbPath);
+      const task = database
+        .prepare(
+          "SELECT state FROM derived_tasks WHERE room_id = ? AND task_seq = ?",
+        )
+        .get(room.room_id, taskSequence) as { state: string } | undefined;
+      database.close();
+      assert.equal(task?.state, "done");
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("expires claims after the fifteen-minute TTL", async () => {
+    const harness = await startHarness();
+    try {
+      const room = await createRoom(harness);
+      const alice = await joinRoom(harness, room.name, "alice");
+      await sync(harness, room.name, "alice", alice.reclaim_token, {
+        outbox: [{ kind: "claim", body: { files: ["relay/src/store.ts"] } }],
+        wait_seconds: 0,
+      });
+      const active = await jsonRequest<{ claims: Array<{ path: string }> }>(
+        harness,
+        `/rooms/${encodeURIComponent(room.name)}/claims?file=relay%2Fsrc%2Fstore.ts`,
+        { headers: { "x-acommune-code": "pair-me" } },
+      );
+      assert.deepEqual(active.body.claims.map((claim) => claim.path), [
+        "relay/src/store.ts",
+      ]);
+
+      const database = openDatabase(harness.dbPath);
+      database
+        .prepare("UPDATE derived_claims SET expires_at = ? WHERE room_id = ?")
+        .run(new Date(0).toISOString(), room.room_id);
+      database.close();
+      const expired = await jsonRequest<{ claims: unknown[] }>(
+        harness,
+        `/rooms/${encodeURIComponent(room.name)}/claims?file=relay%2Fsrc%2Fstore.ts`,
+        { headers: { "x-acommune-code": "pair-me" } },
+      );
+      assert.deepEqual(expired.body.claims, []);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("rebuilds derived tasks and claims identically from the message log", async () => {
+    const harness = await startHarness();
+    try {
+      const room = await createRoom(harness);
+      const alice = await joinRoom(harness, room.name, "alice");
+      const handoff = await sync(harness, room.name, "alice", alice.reclaim_token, {
+        outbox: [
+          { kind: "claim", body: { files: ["relay/", "shared/"] } },
+          { kind: "handoff", body: { summary: "rebuild me", to: "alice" } },
+        ],
+        wait_seconds: 0,
+      });
+      const taskSequence = handoff.body.sent.find(
+        (message) => message.kind === "handoff",
+      )?.seq;
+      await sync(harness, room.name, "alice", alice.reclaim_token, {
+        outbox: [
+          { kind: "task_update", body: { task_seq: taskSequence, status: "claimed" } },
+        ],
+        wait_seconds: 0,
+      });
+
+      const readDerived = (): { claims: unknown[]; tasks: unknown[] } => {
+        const database = openDatabase(harness.dbPath);
+        const claims = database
+          .prepare(
+            `SELECT session_name, path, claim_seq, refreshed_at, expires_at
+               FROM derived_claims WHERE room_id = ? ORDER BY session_name, path`,
+          )
+          .all(room.room_id);
+        const tasks = database
+          .prepare(
+            `SELECT task_seq, summary, to_name, state, created_at, updated_at
+               FROM derived_tasks WHERE room_id = ? ORDER BY task_seq`,
+          )
+          .all(room.room_id);
+        database.close();
+        return { claims, tasks };
+      };
+      const incremental = readDerived();
+      const rebuildStore = new RelayStore(harness.dbPath);
+      rebuildStore.rebuildDerivedState(room.room_id);
+      rebuildStore.close();
+      assert.deepEqual(readDerived(), incremental);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("returns a compact digest from derived sessions, claims, and tasks", async () => {
+    const harness = await startHarness();
+    try {
+      const room = await createRoom(harness);
+      const alice = await joinRoom(harness, room.name, "alice");
+      await sync(harness, room.name, "alice", alice.reclaim_token, {
+        outbox: [
+          { kind: "claim", body: { files: ["relay/src/"] } },
+          { kind: "handoff", body: { summary: "write tests", to: "alice" } },
+        ],
+        wait_seconds: 0,
+      });
+      const digest = await jsonRequest<{
+        room: string;
+        verified: boolean;
+        last_seq: number;
+        sessions: Array<{ name: string; last_seen: string; active_claims: string[] }>;
+        open_tasks: Array<{ id: number; summary: string; to: string | null; state: string; age_seconds: number }>;
+      }>(harness, `/rooms/${encodeURIComponent(room.name)}/digest`, {
+        headers: { "x-acommune-code": "pair-me" },
+      });
+      assert.equal(digest.status, 200);
+      assert.equal(digest.body.room, room.name);
+      assert.equal(digest.body.verified, true);
+      assert.equal(typeof digest.body.last_seq, "number");
+      assert.deepEqual(digest.body.sessions[0]?.active_claims, ["relay/src/"]);
+      assert.equal(digest.body.open_tasks[0]?.summary, "write tests");
+      assert.ok(Buffer.byteLength(JSON.stringify(digest.body), "utf8") <= 2_048);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("finds exact and directory-prefix claim conflicts", async () => {
+    const harness = await startHarness();
+    try {
+      const room = await createRoom(harness);
+      const alice = await joinRoom(harness, room.name, "alice");
+      const bob = await joinRoom(harness, room.name, "bob");
+      await sync(harness, room.name, "alice", alice.reclaim_token, {
+        outbox: [{ kind: "claim", body: { files: ["lib/tools/"] } }],
+        wait_seconds: 0,
+      });
+      await sync(harness, room.name, "bob", bob.reclaim_token, {
+        outbox: [{ kind: "claim", body: { files: ["lib/tools/x.js", "other.js"] } }],
+        wait_seconds: 0,
+      });
+      const fileLookup = await jsonRequest<{ claims: Array<{ path: string }> }>(
+        harness,
+        `/rooms/${encodeURIComponent(room.name)}/claims?file=lib%2Ftools%2Fx.js`,
+        { headers: { "x-acommune-code": "pair-me" } },
+      );
+      assert.deepEqual(
+        new Set(fileLookup.body.claims.map((claim) => claim.path)),
+        new Set(["lib/tools/", "lib/tools/x.js"]),
+      );
+      const directoryLookup = await jsonRequest<{ claims: Array<{ path: string }> }>(
+        harness,
+        `/rooms/${encodeURIComponent(room.name)}/claims?file=lib%2Ftools%2F`,
+        { headers: { "x-acommune-code": "pair-me" } },
+      );
+      assert.deepEqual(
+        new Set(directoryLookup.body.claims.map((claim) => claim.path)),
+        new Set(["lib/tools/", "lib/tools/x.js"]),
+      );
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("rotates room codes while preserving reclaim-token access", async () => {
+    const harness = await startHarness();
+    try {
+      const room = await createRoom(harness);
+      const alice = await joinRoom(harness, room.name, "alice");
+      const tooShort = await jsonRequest<unknown>(
+        harness,
+        `/rooms/${encodeURIComponent(room.name)}/rotate-code`,
+        {
+          method: "POST",
+          headers: { "x-acommune-code": "pair-me" },
+          body: JSON.stringify({ new_code: "short" }),
+        },
+      );
+      assert.equal(tooShort.status, 400);
+
+      const rotated = await jsonRequest<{ ok: boolean }>(
+        harness,
+        `/rooms/${encodeURIComponent(room.name)}/rotate-code`,
+        {
+          method: "POST",
+          headers: { "x-acommune-code": "pair-me" },
+          body: JSON.stringify({ new_code: "new-code-1234" }),
+        },
+      );
+      assert.deepEqual(rotated, { status: 200, body: { ok: true } });
+      const oldCode = await jsonRequest<unknown>(
+        harness,
+        `/rooms/${encodeURIComponent(room.name)}/digest`,
+        { headers: { "x-acommune-code": "pair-me" } },
+      );
+      assert.equal(oldCode.status, 401);
+      const newCode = await jsonRequest<unknown>(
+        harness,
+        `/rooms/${encodeURIComponent(room.name)}/digest`,
+        { headers: { "x-acommune-code": "new-code-1234" } },
+      );
+      assert.equal(newCode.status, 200);
+      const tokenStillWorks = await sync(
+        harness,
+        room.name,
+        "alice",
+        alice.reclaim_token,
+        { outbox: [{ kind: "progress", body: "after rotation" }], wait_seconds: 0 },
+      );
+      assert.equal(tokenStillWorks.status, 200);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("generates unique 128-bit pairing codes when room creation omits one", async () => {
+    const harness = await startHarness();
+    try {
+      const first = await jsonRequest<RoomResponse & { pairing_code: string }>(
+        harness,
+        "/rooms",
+        { method: "POST", body: JSON.stringify({ name: "generated-one" }) },
+      );
+      const second = await jsonRequest<RoomResponse & { pairing_code: string }>(
+        harness,
+        "/rooms",
+        { method: "POST", body: JSON.stringify({ name: "generated-two" }) },
+      );
+      assert.equal(first.status, 201);
+      assert.equal(second.status, 201);
+      assert.match(first.body.pairing_code, /^[a-f0-9]{32}$/);
+      assert.match(second.body.pairing_code, /^[a-f0-9]{32}$/);
+      assert.notEqual(first.body.pairing_code, second.body.pairing_code);
     } finally {
       await harness.close();
     }
