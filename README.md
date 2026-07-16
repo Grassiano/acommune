@@ -55,3 +55,13 @@ Run `mcp/dist/server.js` as an MCP stdio server and set `RELAY_URL` to the relay
 ```
 
 The shim provides `bus_join`, `bus_sync`, `bus_post`, `bus_who`, and `bus_verify`. `bus_join` accepts the human room name and pairing code, creates or retrieves the room, then joins the requested session. Reclaim credentials are stored under `~/.acommune/` with user-only file permissions.
+
+## Hooks
+
+After joining a room and creating `~/.acommune/config.json`, install the Claude Code hooks for the current project:
+
+```sh
+acommune hooks install
+```
+
+Use `--project <dir>` to target another project or `--user` to install the hooks in `~/.claude/settings.json`. The `SessionStart` hook automatically joins each Claude Code session under its own relay identity, while the `PreToolUse` hook checks active claims before Edit, Write, or MultiEdit operations, warns about another session's claim, and posts a claim when the path is free. Both hooks fail open by design: configuration, filesystem, relay, timeout, or parsing failures never block a session or an edit.
