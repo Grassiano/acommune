@@ -44,6 +44,7 @@ interface AcommuneConfig {
   room: string;
   code: string;
   sessionNamePrefix?: string;
+  joinTempDirs?: boolean;
 }
 
 interface SessionIdentity {
@@ -333,6 +334,9 @@ async function loadAcommuneConfig(): Promise<AcommuneConfig> {
     ...(parsed.session_name_prefix === undefined
       ? {}
       : { sessionNamePrefix: parsed.session_name_prefix }),
+    ...(typeof parsed.join_temp_dirs === "boolean"
+      ? { joinTempDirs: parsed.join_temp_dirs }
+      : {}),
   };
 }
 
@@ -505,11 +509,26 @@ async function writePrivateJson(path: string, value: unknown): Promise<void> {
   }
 }
 
+function isEphemeralSessionCwd(cwd: string, environment: NodeJS.ProcessEnv): boolean {
+  const normalizedCwd = resolve(cwd).replace(/\\/g, "/");
+  const tempRoots = ["/tmp/", "/private/tmp/", "/var/folders/"];
+  if (environment.TMPDIR !== undefined && environment.TMPDIR.length > 0) {
+    tempRoots.push(`${environment.TMPDIR.replace(/\\/g, "/").replace(/\/+$/, "")}/`);
+  }
+
+  // Prefix matching intentionally treats every directory beneath a temp root as ephemeral.
+  return (
+    tempRoots.some((root) => normalizedCwd.startsWith(root)) ||
+    /^tmp\.|^\.tmp|^scratchpad$/i.test(basename(normalizedCwd))
+  );
+}
+
 async function runSessionStartHook(): Promise<void> {
   try {
     const input = await readStdinJson();
     if (typeof input.session_id !== "string" || typeof input.cwd !== "string") return;
     const config = await loadAcommuneConfig();
+    if (config.joinTempDirs !== true && isEphemeralSessionCwd(input.cwd, process.env)) return;
     const deadline = Date.now() + HOOK_HTTP_TIMEOUT_MS;
     const baseName = `${config.sessionNamePrefix ?? "cc"}-${basename(input.cwd)}`;
 

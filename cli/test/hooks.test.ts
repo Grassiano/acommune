@@ -191,13 +191,23 @@ async function unreachableRelay(directory: string): Promise<RelayHandle> {
   }
 }
 
-async function writeConfig(directory: string, relay: string, room = "demo"): Promise<void> {
+async function writeConfig(
+  directory: string,
+  relay: string,
+  room = "demo",
+  joinTempDirs?: boolean,
+): Promise<void> {
   const acommuneDirectory = join(directory, ".acommune");
   await mkdir(acommuneDirectory, { recursive: true, mode: 0o700 });
   const path = join(acommuneDirectory, "config.json");
   await writeFile(
     path,
-    `${JSON.stringify({ relay, room, code: "pairing-code" }, null, 2)}\n`,
+    `${JSON.stringify({
+      relay,
+      room,
+      code: "pairing-code",
+      ...(joinTempDirs === undefined ? {} : { join_temp_dirs: joinTempDirs }),
+    }, null, 2)}\n`,
     { encoding: "utf8", mode: 0o600 },
   );
   await chmod(path, 0o600);
@@ -322,7 +332,7 @@ describe("acommune hook session-start", () => {
     const result = await runCli(
       directory,
       ["hook", "session-start"],
-      { session_id: "session-1", cwd: join(directory, "project") },
+      { session_id: "session-1", cwd: "/Users/tester/project" },
       relay.environment,
     );
 
@@ -343,6 +353,112 @@ describe("acommune hook session-start", () => {
     assert.deepEqual(await jsonObject(identityPath), {
       session_name: "cc-project",
       reclaim_token: "token-one",
+      room: "demo",
+      relay: relay.url,
+    });
+    assert.equal((await stat(identityPath)).mode & 0o777, 0o600);
+    assert.equal((await stat(join(directory, ".acommune", "sessions"))).mode & 0o777, 0o700);
+  });
+
+  it("skips sessions whose cwd is under a system temp root", async () => {
+    const directory = await tempDirectory();
+    let requestCount = 0;
+    const relay = await fakeRelay(directory, (_request, response) => {
+      requestCount += 1;
+      sendJson(response, 500, { error: { code: "TEST_FAILURE", message: "unexpected" } });
+    }, [{ status: 500, body: { error: { code: "TEST_FAILURE", message: "unexpected" } } }]);
+    await writeConfig(directory, relay.url);
+
+    const result = await runCli(
+      directory,
+      ["hook", "session-start"],
+      {
+        session_id: "session-private-tmp",
+        cwd: "/private/tmp/cc-tmp.omaLx76bsP/project",
+      },
+      relay.environment,
+    );
+
+    assert.deepEqual(result, { code: 0, stdout: "", stderr: "" });
+    assert.equal(requestCount, 0);
+    assert.deepEqual(await relay.requests(), []);
+    await assert.rejects(
+      readFile(join(
+        directory,
+        ".acommune",
+        "sessions",
+        "demo.session-private-tmp.json",
+      )),
+    );
+  });
+
+  it("skips sessions whose cwd basename is ephemeral outside a temp root", async () => {
+    const directory = await tempDirectory();
+    let requestCount = 0;
+    const relay = await fakeRelay(directory, (_request, response) => {
+      requestCount += 1;
+      sendJson(response, 500, { error: { code: "TEST_FAILURE", message: "unexpected" } });
+    }, [{ status: 500, body: { error: { code: "TEST_FAILURE", message: "unexpected" } } }]);
+    await writeConfig(directory, relay.url);
+
+    const result = await runCli(
+      directory,
+      ["hook", "session-start"],
+      { session_id: "session-tmp-basename", cwd: "/Users/tester/tmp.abc123" },
+      relay.environment,
+    );
+
+    assert.deepEqual(result, { code: 0, stdout: "", stderr: "" });
+    assert.equal(requestCount, 0);
+    assert.deepEqual(await relay.requests(), []);
+    await assert.rejects(
+      readFile(join(
+        directory,
+        ".acommune",
+        "sessions",
+        "demo.session-tmp-basename.json",
+      )),
+    );
+  });
+
+  it("joins temp-directory sessions when join_temp_dirs is enabled", async () => {
+    const directory = await tempDirectory();
+    const requests: JsonObject[] = [];
+    const relay = await fakeRelay(directory, async (request, response) => {
+      assert.equal(request.method, "POST");
+      assert.equal(request.url, "/rooms/demo/join");
+      requests.push(await requestJson(request));
+      sendJson(response, 200, { reclaim_token: "token-temp", cursor: 5 });
+    }, [{ body: { reclaim_token: "token-temp", cursor: 5 } }]);
+    await writeConfig(directory, relay.url, "demo", true);
+
+    const result = await runCli(
+      directory,
+      ["hook", "session-start"],
+      {
+        session_id: "session-temp-enabled",
+        cwd: "/private/tmp/cc-tmp.override/project",
+      },
+      relay.environment,
+    );
+
+    assert.deepEqual(result, { code: 0, stdout: "", stderr: "" });
+    const recorded = await relay.requests();
+    const joinRequests = requests.length > 0
+      ? requests
+      : recorded.map((request) => request.body).filter(isJsonObject);
+    assert.deepEqual(joinRequests, [
+      { session_name: "cc-project", pairing_code: "pairing-code" },
+    ]);
+    const identityPath = join(
+      directory,
+      ".acommune",
+      "sessions",
+      "demo.session-temp-enabled.json",
+    );
+    assert.deepEqual(await jsonObject(identityPath), {
+      session_name: "cc-project",
+      reclaim_token: "token-temp",
       room: "demo",
       relay: relay.url,
     });
@@ -376,7 +492,7 @@ describe("acommune hook session-start", () => {
     const result = await runCli(
       directory,
       ["hook", "session-start"],
-      { session_id: "session-2", cwd: join(directory, "project") },
+      { session_id: "session-2", cwd: "/Users/tester/project" },
       relay.environment,
     );
 
@@ -404,7 +520,7 @@ describe("acommune hook session-start", () => {
     const result = await runCli(
       directory,
       ["hook", "session-start"],
-      { session_id: "session-down", cwd: join(directory, "project") },
+      { session_id: "session-down", cwd: "/Users/tester/project" },
       relay.environment,
     );
 
