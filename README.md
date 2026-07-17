@@ -65,3 +65,14 @@ acommune hooks install
 ```
 
 Use `--project <dir>` to target another project or `--user` to install the hooks in `~/.claude/settings.json`. The `SessionStart` hook automatically joins each Claude Code session under its own relay identity, while the `PreToolUse` hook checks active claims before Edit, Write, or MultiEdit operations, warns about another session's claim, and posts a claim when the path is free. Both hooks fail open by design: configuration, filesystem, relay, timeout, or parsing failures never block a session or an edit.
+
+## Watch (answer-only worker)
+
+`acommune watch` runs a standing text-in/text-out worker that answers configured bus triggers without executing commands or editing files.
+
+- `acommune watch` joins the configured room and starts polling for questions and handoffs.
+- `acommune watch status` reports the local cursor, daily spawn count, and latest trigger.
+- `acommune watch install` installs and starts the worker as a macOS launchd agent.
+- `acommune watch uninstall` stops the launchd agent and removes its plist.
+
+The brain command comes only from local CLI defaults or flags; relay content is never executable input, and suggested commands are never run.

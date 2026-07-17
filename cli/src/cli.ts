@@ -3,6 +3,7 @@ import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFile } from "node:child_process";
 import {
   chmod,
   copyFile,
@@ -13,15 +14,36 @@ import {
   unlink,
   writeFile,
 } from "node:fs/promises";
+import { KINDS, type Kind } from "acommune-shared";
+import {
+  isJsonObject,
+  isSafeFilePart,
+  writePrivateJson,
+  type JsonObject,
+} from "./private-files.js";
+import {
+  readAudit,
+  readWatchCursor,
+  runWatchLoop,
+  watchAuditPath,
+  watchCursorPath,
+  type WatchIdentity,
+} from "./watch.js";
 
 const DEFAULT_RELAY_URL = "http://127.0.0.1:4477";
 const HOOK_HTTP_TIMEOUT_MS = 2_000;
 const CLAIM_CACHE_FRESH_MS = 10 * 60 * 1_000;
 const CLAIM_CACHE_MAX_AGE_MS = 60 * 60 * 1_000;
 const HOOK_COMMAND_MARKER = "acommune hook";
+const DEFAULT_BRAIN_COMMAND = "claude -p --permission-mode plan";
+const WATCH_LABEL = "com.acommune.watch";
 const USAGE = `Usage:
   acommune join <room> --code <code> [--relay <url>] [--name <session_name>] [--config <path>]
   acommune hooks install [--project <dir> | --user]
+  acommune watch [--room X] [--triggers question,handoff] [--poll-seconds 5] [--cooldown 60] [--max-per-day 50] [--brain-cmd <cmd>] [--name worker]
+  acommune watch status
+  acommune watch install
+  acommune watch uninstall
   acommune hook <session-start | claim>  (internal)
   acommune --help
   acommune --version`;
@@ -37,6 +59,16 @@ interface JoinOptions {
 interface HooksInstallOptions {
   project?: string;
   user: boolean;
+}
+
+interface WatchOptions {
+  room?: string;
+  triggerKinds: Kind[];
+  pollSeconds: number;
+  cooldownSeconds: number;
+  maxPerDay: number;
+  brainCmd: string;
+  name: string;
 }
 
 interface AcommuneConfig {
@@ -59,13 +91,7 @@ interface ActiveClaim {
   refreshedAt: string;
 }
 
-type JsonObject = Record<string, unknown>;
-
 class CliError extends Error {}
-
-function isJsonObject(value: unknown): value is JsonObject {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function expandHome(path: string): string {
   if (path === "~") return homedir();
@@ -205,6 +231,88 @@ function parseHooksInstall(args: readonly string[]): HooksInstallOptions {
     throw new CliError("--project and --user cannot be used together.");
   }
   return { ...(project === undefined ? {} : { project }), user };
+}
+
+function positiveNumber(value: string, flag: string, allowZero: boolean): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || (allowZero ? parsed < 0 : parsed <= 0)) {
+    throw new CliError(`${flag} needs ${allowZero ? "a non-negative" : "a positive"} number.`);
+  }
+  return parsed;
+}
+
+function parseWatch(args: readonly string[]): WatchOptions {
+  let room: string | undefined;
+  let triggerKinds: Kind[] = ["question", "handoff"];
+  let pollSeconds = 5;
+  let cooldownSeconds = 60;
+  let maxPerDay = 50;
+  let brainCmd = DEFAULT_BRAIN_COMMAND;
+  let name = "worker";
+  const knownKinds = new Set<string>(KINDS);
+
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index]!;
+    const equals = argument.indexOf("=");
+    const flag = equals === -1 ? argument : argument.slice(0, equals);
+    const inlineValue = equals === -1 ? undefined : argument.slice(equals + 1);
+    const value = (): string => {
+      if (inlineValue !== undefined) {
+        if (inlineValue === "") throw new CliError(`${flag} needs a value.`);
+        return inlineValue;
+      }
+      index += 1;
+      return readFlagValue(args, index - 1, flag);
+    };
+
+    switch (flag) {
+      case "--room":
+        room = value().trim();
+        if (room === "") throw new CliError("--room cannot be empty.");
+        break;
+      case "--triggers": {
+        const requested = value().split(",").map((kind) => kind.trim());
+        if (requested.length === 0 || requested.some((kind) => !knownKinds.has(kind))) {
+          throw new CliError(`--triggers must contain only: ${KINDS.join(",")}.`);
+        }
+        triggerKinds = [...new Set(requested)] as Kind[];
+        break;
+      }
+      case "--poll-seconds":
+        pollSeconds = positiveNumber(value(), flag, false);
+        break;
+      case "--cooldown":
+        cooldownSeconds = positiveNumber(value(), flag, true);
+        break;
+      case "--max-per-day":
+        maxPerDay = positiveNumber(value(), flag, false);
+        if (!Number.isInteger(maxPerDay)) throw new CliError("--max-per-day needs a positive integer.");
+        break;
+      case "--brain-cmd":
+        brainCmd = value().trim();
+        if (brainCmd === "") throw new CliError("--brain-cmd cannot be empty.");
+        break;
+      case "--name":
+        name = value().trim();
+        if (name === "") throw new CliError("--name cannot be empty.");
+        break;
+      default:
+        throw new CliError(
+          argument.startsWith("-")
+            ? `Unknown option: ${argument}`
+            : `Unexpected argument: ${argument}`,
+        );
+    }
+  }
+  return {
+    ...(room === undefined ? {} : { room }),
+    triggerKinds,
+    pollSeconds,
+    cooldownSeconds,
+    maxPerDay,
+    brainCmd,
+    name,
+  };
 }
 
 async function resolveConfigPath(override?: string): Promise<string> {
@@ -474,39 +582,11 @@ function relayErrorCode(value: JsonObject): string | undefined {
     : undefined;
 }
 
-function isSafeFilePart(value: string): boolean {
-  return value !== "" && value !== "." && value !== ".." && !value.includes("/") && !value.includes("\\");
-}
-
 function sessionIdentityPath(room: string, sessionId: string): string {
   if (!isSafeFilePart(room) || !isSafeFilePart(sessionId)) {
     throw new Error("Unsafe session identity name");
   }
   return join(homedir(), ".acommune", "sessions", `${room}.${sessionId}.json`);
-}
-
-async function writePrivateJson(path: string, value: unknown): Promise<void> {
-  const directory = dirname(path);
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  const acommuneDirectory = join(homedir(), ".acommune");
-  await chmod(acommuneDirectory, 0o700);
-  await chmod(directory, 0o700);
-  const temporary = `${path}.${process.pid}.tmp`;
-  try {
-    await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-    });
-    await rename(temporary, path);
-    await chmod(path, 0o600);
-  } catch (error: unknown) {
-    try {
-      await unlink(temporary);
-    } catch {
-      // The temporary file may not have been created.
-    }
-    throw error;
-  }
 }
 
 function isEphemeralSessionCwd(cwd: string, environment: NodeJS.ProcessEnv): boolean {
@@ -523,6 +603,43 @@ function isEphemeralSessionCwd(cwd: string, environment: NodeJS.ProcessEnv): boo
   );
 }
 
+async function joinRelaySession(
+  relay: string,
+  room: string,
+  code: string,
+  baseName: string,
+  deadline?: number,
+): Promise<WatchIdentity> {
+  for (let attempt = 1; attempt <= 20; attempt += 1) {
+    const sessionName = attempt === 1 ? baseName : `${baseName}-${attempt}`;
+    const url = `${relay}/rooms/${encodeURIComponent(room)}/join`;
+    const init: RequestInit = {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ session_name: sessionName, pairing_code: code }),
+    };
+    const response = deadline === undefined
+      ? await fetch(url, init)
+      : await fetchBeforeDeadline(url, init, deadline);
+    const result = await responseJson(response);
+    if (response.ok) {
+      if (typeof result.reclaim_token !== "string" || typeof result.cursor !== "number") {
+        throw new Error("Invalid join response");
+      }
+      return {
+        sessionName,
+        reclaimToken: result.reclaim_token,
+        room,
+        relay,
+      };
+    }
+    if (response.status !== 409 || relayErrorCode(result) !== "AGENT_NAME_IN_USE") {
+      throw new Error("Relay rejected session join");
+    }
+  }
+  throw new Error("Could not find an available session name after 20 attempts");
+}
+
 async function runSessionStartHook(): Promise<void> {
   try {
     const input = await readStdinJson();
@@ -531,41 +648,23 @@ async function runSessionStartHook(): Promise<void> {
     if (config.joinTempDirs !== true && isEphemeralSessionCwd(input.cwd, process.env)) return;
     const deadline = Date.now() + HOOK_HTTP_TIMEOUT_MS;
     const baseName = `${config.sessionNamePrefix ?? "cc"}-${basename(input.cwd)}`;
-
-    for (let attempt = 1; attempt <= 20; attempt += 1) {
-      const sessionName = attempt === 1 ? baseName : `${baseName}-${attempt}`;
-      const response = await fetchBeforeDeadline(
-        `${config.relay}/rooms/${encodeURIComponent(config.room)}/join`,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            session_name: sessionName,
-            pairing_code: config.code,
-          }),
-        },
-        deadline,
-      );
-      const result = await responseJson(response);
-      if (response.ok) {
-        if (typeof result.reclaim_token !== "string" || typeof result.cursor !== "number") {
-          throw new Error("Invalid join response");
-        }
-        await writePrivateJson(
-          sessionIdentityPath(config.room, input.session_id),
-          {
-            session_name: sessionName,
-            reclaim_token: result.reclaim_token,
-            room: config.room,
-            relay: config.relay,
-          },
-        );
-        return;
-      }
-      if (response.status !== 409 || relayErrorCode(result) !== "AGENT_NAME_IN_USE") {
-        throw new Error("Relay rejected session join");
-      }
-    }
+    const identity = await joinRelaySession(
+      config.relay,
+      config.room,
+      config.code,
+      baseName,
+      deadline,
+    );
+    await writePrivateJson(
+      sessionIdentityPath(config.room, input.session_id),
+      {
+        session_name: identity.sessionName,
+        reclaim_token: identity.reclaimToken,
+        room: identity.room,
+        relay: identity.relay,
+      },
+    );
+    return;
   } catch {
     // Session hooks always fail open and must not add transcript noise.
   }
@@ -810,6 +909,162 @@ async function joinRoom(options: JoinOptions): Promise<void> {
   );
 }
 
+function requireSafeWatchRoom(room: string): void {
+  if (!isSafeFilePart(room)) {
+    throw new CliError("Watch room names cannot contain slashes or path components.");
+  }
+}
+
+async function runWatch(options: WatchOptions): Promise<void> {
+  const config = await loadAcommuneConfig();
+  const room = options.room ?? config.room;
+  requireSafeWatchRoom(room);
+  const identity = await joinRelaySession(
+    config.relay,
+    room,
+    config.code,
+    options.name,
+  );
+  await writePrivateJson(
+    sessionIdentityPath(room, "watch"),
+    {
+      session_name: identity.sessionName,
+      reclaim_token: identity.reclaimToken,
+      room: identity.room,
+      relay: identity.relay,
+    },
+  );
+  process.stdout.write(`Watching #${room} as ${identity.sessionName} (answer-only).\n`);
+  await runWatchLoop({
+    relay: config.relay,
+    room,
+    code: config.code,
+    identity,
+    triggerKinds: options.triggerKinds,
+    brainCmd: options.brainCmd,
+    auditPath: watchAuditPath(room),
+    cursorPath: watchCursorPath(room),
+    maxPerDay: options.maxPerDay,
+    pollSeconds: options.pollSeconds,
+    cooldownSeconds: options.cooldownSeconds,
+  });
+}
+
+async function watchStatus(): Promise<void> {
+  const config = await loadAcommuneConfig();
+  requireSafeWatchRoom(config.room);
+  const cursor = await readWatchCursor(watchCursorPath(config.room));
+  const records = await readAudit(watchAuditPath(config.room));
+  const today = new Date().toISOString().slice(0, 10);
+  const spawns = records.filter(
+    (record) => record.ts.startsWith(today) && record.outcome !== "capped",
+  ).length;
+  const last = records.at(-1);
+  process.stdout.write(
+    `Relay: ${config.relay}\n` +
+      `Room: ${config.room}\n` +
+      `Cursor: ${cursor}\n` +
+      `Spawns today: ${spawns}\n` +
+      `Last trigger: ${last === undefined ? "none yet" : `${last.kind} from ${last.sender} at ${last.ts} (${last.outcome})`}\n`,
+  );
+}
+
+function xmlText(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+function launchAgentPath(): string {
+  return join(homedir(), "Library", "LaunchAgents", `${WATCH_LABEL}.plist`);
+}
+
+function runLaunchctl(args: readonly string[], ignoreFailure: boolean): Promise<void> {
+  return new Promise((resolveLaunchctl, reject) => {
+    execFile("launchctl", [...args], (error) => {
+      if (error === null || ignoreFailure) {
+        resolveLaunchctl();
+        return;
+      }
+      reject(new CliError(`launchctl ${args[0] ?? "command"} failed: ${error.message}`));
+    });
+  });
+}
+
+function watchPlist(stdoutPath: string, stderrPath: string): string {
+  const path = [dirname(process.execPath), process.env.PATH ?? ""].filter((part) => part !== "").join(":");
+  const argumentsList = [process.execPath, resolveCliEntry(), "watch"]
+    .map((argument) => `      <string>${xmlText(argument)}</string>`)
+    .join("\n");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>${WATCH_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+${argumentsList}
+    </array>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>PATH</key>
+      <string>${xmlText(path)}</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>${xmlText(stdoutPath)}</string>
+    <key>StandardErrorPath</key>
+    <string>${xmlText(stderrPath)}</string>
+  </dict>
+</plist>
+`;
+}
+
+function launchdUid(): number {
+  if (typeof process.getuid !== "function") {
+    throw new CliError("acommune watch install is available only on macOS/POSIX systems.");
+  }
+  return process.getuid();
+}
+
+async function installWatch(): Promise<void> {
+  await loadAcommuneConfig();
+  const uid = launchdUid();
+  const plistPath = launchAgentPath();
+  const logsDirectory = join(homedir(), ".acommune", "logs");
+  await mkdir(logsDirectory, { recursive: true, mode: 0o700 });
+  await chmod(join(homedir(), ".acommune"), 0o700);
+  await chmod(logsDirectory, 0o700);
+  await mkdir(dirname(plistPath), { recursive: true });
+  await writeFile(
+    plistPath,
+    watchPlist(join(logsDirectory, "watch.out.log"), join(logsDirectory, "watch.err.log")),
+    { encoding: "utf8", mode: 0o600 },
+  );
+  await chmod(plistPath, 0o600);
+  await runLaunchctl(["bootout", `gui/${uid}/${WATCH_LABEL}`], true);
+  await runLaunchctl(["bootstrap", `gui/${uid}`, plistPath], false);
+  process.stdout.write(`Installed and started ${WATCH_LABEL}.\n`);
+}
+
+async function uninstallWatch(): Promise<void> {
+  const uid = launchdUid();
+  await runLaunchctl(["bootout", `gui/${uid}/${WATCH_LABEL}`], true);
+  try {
+    await unlink(launchAgentPath());
+  } catch (error: unknown) {
+    if (!isJsonObject(error) || error.code !== "ENOENT") throw error;
+  }
+  process.stdout.write(`Uninstalled ${WATCH_LABEL}.\n`);
+}
+
 async function main(args: readonly string[]): Promise<void> {
   const command = args[0];
   if (command === undefined || command === "--help" || command === "-h") {
@@ -826,6 +1081,22 @@ async function main(args: readonly string[]): Promise<void> {
   }
   if (command === "hooks" && args[1] === "install") {
     await installHooks(parseHooksInstall(args.slice(2)));
+    return;
+  }
+  if (command === "watch" && args[1] === "status" && args.length === 2) {
+    await watchStatus();
+    return;
+  }
+  if (command === "watch" && args[1] === "install" && args.length === 2) {
+    await installWatch();
+    return;
+  }
+  if (command === "watch" && args[1] === "uninstall" && args.length === 2) {
+    await uninstallWatch();
+    return;
+  }
+  if (command === "watch") {
+    await runWatch(parseWatch(args.slice(1)));
     return;
   }
   if (command === "hook" && args[1] === "session-start" && args.length === 2) {
