@@ -30,6 +30,12 @@ import {
   watchCursorPath,
   type WatchIdentity,
 } from "./watch.js";
+import {
+  formatHarvestResult,
+  harvestCursorPath,
+  readHarvestCursor,
+  runHarvest,
+} from "./harvest.js";
 
 const DEFAULT_RELAY_URL = "http://127.0.0.1:4477";
 const HOOK_HTTP_TIMEOUT_MS = 2_000;
@@ -38,6 +44,7 @@ const CLAIM_CACHE_MAX_AGE_MS = 60 * 60 * 1_000;
 const HOOK_COMMAND_MARKER = "acommune hook";
 const DEFAULT_BRAIN_COMMAND = "claude -p --permission-mode plan";
 const WATCH_LABEL = "com.acommune.watch";
+const HARVEST_LABEL = "com.acommune.harvest";
 const USAGE = `Usage:
   acommune join <room> --code <code> [--relay <url>] [--name <session_name>] [--config <path>]
   acommune hooks install [--project <dir> | --user]
@@ -45,6 +52,9 @@ const USAGE = `Usage:
   acommune watch status
   acommune watch install
   acommune watch uninstall
+  acommune harvest [--room X] [--kinds knowledge] [--since <seq>] [--dry-run] [--vault <path>]
+  acommune harvest install
+  acommune harvest uninstall
   acommune hook <session-start | claim | prompt-context | share-nudge>  (internal)
   acommune --help
   acommune --version`;
@@ -72,12 +82,21 @@ interface WatchOptions {
   name: string;
 }
 
+interface HarvestCliOptions {
+  room?: string;
+  kinds: Kind[];
+  since?: number;
+  dryRun: boolean;
+  vault?: string;
+}
+
 interface AcommuneConfig {
   relay: string;
   room: string;
   code: string;
   sessionNamePrefix?: string;
   joinTempDirs?: boolean;
+  vaultPath?: string;
 }
 
 interface SessionIdentity {
@@ -316,6 +335,72 @@ function parseWatch(args: readonly string[]): WatchOptions {
   };
 }
 
+function parseHarvest(args: readonly string[]): HarvestCliOptions {
+  let room: string | undefined;
+  let kinds: Kind[] = ["knowledge"];
+  let since: number | undefined;
+  let dryRun = false;
+  let vault: string | undefined;
+  const knownKinds = new Set<string>(KINDS);
+
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index]!;
+    const equals = argument.indexOf("=");
+    const flag = equals === -1 ? argument : argument.slice(0, equals);
+    const inlineValue = equals === -1 ? undefined : argument.slice(equals + 1);
+    const value = (): string => {
+      if (inlineValue !== undefined) {
+        if (inlineValue === "") throw new CliError(`${flag} needs a value.`);
+        return inlineValue;
+      }
+      index += 1;
+      return readFlagValue(args, index - 1, flag);
+    };
+
+    switch (flag) {
+      case "--room":
+        room = value().trim();
+        if (room === "") throw new CliError("--room cannot be empty.");
+        break;
+      case "--kinds": {
+        const requested = value().split(",").map((kind) => kind.trim());
+        if (requested.length === 0 || requested.some((kind) => !knownKinds.has(kind))) {
+          throw new CliError(`--kinds must contain only: ${KINDS.join(",")}.`);
+        }
+        kinds = [...new Set(requested)] as Kind[];
+        break;
+      }
+      case "--since": {
+        const parsed = positiveNumber(value(), flag, true);
+        if (!Number.isInteger(parsed)) throw new CliError("--since needs a non-negative integer.");
+        since = parsed;
+        break;
+      }
+      case "--dry-run":
+        if (inlineValue !== undefined) throw new CliError("--dry-run does not take a value.");
+        dryRun = true;
+        break;
+      case "--vault":
+        vault = value().trim();
+        if (vault === "") throw new CliError("--vault cannot be empty.");
+        break;
+      default:
+        throw new CliError(
+          argument.startsWith("-")
+            ? `Unknown option: ${argument}`
+            : `Unexpected argument: ${argument}`,
+        );
+    }
+  }
+  return {
+    ...(room === undefined ? {} : { room }),
+    kinds,
+    ...(since === undefined ? {} : { since }),
+    dryRun,
+    ...(vault === undefined ? {} : { vault }),
+  };
+}
+
 async function resolveConfigPath(override?: string): Promise<string> {
   if (override !== undefined) return resolve(expandHome(override));
   const claudeConfig = join(homedir(), ".claude.json");
@@ -415,7 +500,9 @@ async function loadAcommuneConfig(): Promise<AcommuneConfig> {
     parsed.room.length === 0 ||
     parsed.code.length === 0 ||
     (parsed.session_name_prefix !== undefined &&
-      typeof parsed.session_name_prefix !== "string")
+      typeof parsed.session_name_prefix !== "string") ||
+    (parsed.vault_path !== undefined &&
+      (typeof parsed.vault_path !== "string" || parsed.vault_path.trim() === ""))
   ) {
     throw new CliError(
       `No acommune config found at ${path}. Run \`acommune join <room> --code <code>\` first.`,
@@ -446,6 +533,7 @@ async function loadAcommuneConfig(): Promise<AcommuneConfig> {
     ...(typeof parsed.join_temp_dirs === "boolean"
       ? { joinTempDirs: parsed.join_temp_dirs }
       : {}),
+    ...(parsed.vault_path === undefined ? {} : { vaultPath: parsed.vault_path }),
   };
 }
 
@@ -1160,6 +1248,34 @@ async function runWatch(options: WatchOptions): Promise<void> {
   });
 }
 
+async function runHarvestCommand(options: HarvestCliOptions): Promise<void> {
+  const config = await loadAcommuneConfig();
+  const room = options.room ?? config.room;
+  const cursorPath = harvestCursorPath(room);
+  const vaultPath = resolve(
+    expandHome(options.vault ?? config.vaultPath ?? join(homedir(), "Documents", "Vault Guy")),
+  );
+  const storedCursor = await readHarvestCursor(cursorPath);
+  const afterSeq = options.since ?? storedCursor;
+  let result: Awaited<ReturnType<typeof runHarvest>>;
+  try {
+    result = await runHarvest({
+      relay: config.relay,
+      room,
+      code: config.code,
+      kinds: options.kinds,
+      afterSeq,
+      vaultPath,
+      cursorPath,
+      cursorFloor: storedCursor,
+      dryRun: options.dryRun,
+    });
+  } catch (error: unknown) {
+    throw new CliError(`Harvest failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  process.stdout.write(formatHarvestResult(result, options.dryRun));
+}
+
 async function watchStatus(): Promise<void> {
   const config = await loadAcommuneConfig();
   requireSafeWatchRoom(config.room);
@@ -1188,8 +1304,8 @@ function xmlText(value: string): string {
     .replaceAll("'", "&apos;");
 }
 
-function launchAgentPath(): string {
-  return join(homedir(), "Library", "LaunchAgents", `${WATCH_LABEL}.plist`);
+function launchAgentPath(label: string): string {
+  return join(homedir(), "Library", "LaunchAgents", `${label}.plist`);
 }
 
 function runLaunchctl(args: readonly string[], ignoreFailure: boolean): Promise<void> {
@@ -1237,9 +1353,42 @@ ${argumentsList}
 `;
 }
 
+function harvestPlist(stdoutPath: string, stderrPath: string): string {
+  const path = [dirname(process.execPath), process.env.PATH ?? ""].filter((part) => part !== "").join(":");
+  const argumentsList = [process.execPath, resolveCliEntry(), "harvest"]
+    .map((argument) => `      <string>${xmlText(argument)}</string>`)
+    .join("\n");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>${HARVEST_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+${argumentsList}
+    </array>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>PATH</key>
+      <string>${xmlText(path)}</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>${xmlText(stdoutPath)}</string>
+    <key>StandardErrorPath</key>
+    <string>${xmlText(stderrPath)}</string>
+  </dict>
+</plist>
+`;
+}
+
 function launchdUid(): number {
   if (typeof process.getuid !== "function") {
-    throw new CliError("acommune watch install is available only on macOS/POSIX systems.");
+    throw new CliError("launchd installation is available only on macOS/POSIX systems.");
   }
   return process.getuid();
 }
@@ -1247,7 +1396,7 @@ function launchdUid(): number {
 async function installWatch(): Promise<void> {
   await loadAcommuneConfig();
   const uid = launchdUid();
-  const plistPath = launchAgentPath();
+  const plistPath = launchAgentPath(WATCH_LABEL);
   const logsDirectory = join(homedir(), ".acommune", "logs");
   await mkdir(logsDirectory, { recursive: true, mode: 0o700 });
   await chmod(join(homedir(), ".acommune"), 0o700);
@@ -1268,11 +1417,45 @@ async function uninstallWatch(): Promise<void> {
   const uid = launchdUid();
   await runLaunchctl(["bootout", `gui/${uid}/${WATCH_LABEL}`], true);
   try {
-    await unlink(launchAgentPath());
+    await unlink(launchAgentPath(WATCH_LABEL));
   } catch (error: unknown) {
     if (!isJsonObject(error) || error.code !== "ENOENT") throw error;
   }
   process.stdout.write(`Uninstalled ${WATCH_LABEL}.\n`);
+}
+
+async function installHarvest(): Promise<void> {
+  await loadAcommuneConfig();
+  const uid = launchdUid();
+  const plistPath = launchAgentPath(HARVEST_LABEL);
+  const logsDirectory = join(homedir(), ".acommune", "logs");
+  await mkdir(logsDirectory, { recursive: true, mode: 0o700 });
+  await chmod(join(homedir(), ".acommune"), 0o700);
+  await chmod(logsDirectory, 0o700);
+  await mkdir(dirname(plistPath), { recursive: true });
+  await writeFile(
+    plistPath,
+    harvestPlist(
+      join(logsDirectory, "harvest.out.log"),
+      join(logsDirectory, "harvest.err.log"),
+    ),
+    { encoding: "utf8", mode: 0o600 },
+  );
+  await chmod(plistPath, 0o600);
+  await runLaunchctl(["bootout", `gui/${uid}/${HARVEST_LABEL}`], true);
+  await runLaunchctl(["bootstrap", `gui/${uid}`, plistPath], false);
+  process.stdout.write(`Installed and started ${HARVEST_LABEL}.\n`);
+}
+
+async function uninstallHarvest(): Promise<void> {
+  const uid = launchdUid();
+  await runLaunchctl(["bootout", `gui/${uid}/${HARVEST_LABEL}`], true);
+  try {
+    await unlink(launchAgentPath(HARVEST_LABEL));
+  } catch (error: unknown) {
+    if (!isJsonObject(error) || error.code !== "ENOENT") throw error;
+  }
+  process.stdout.write(`Uninstalled ${HARVEST_LABEL}.\n`);
 }
 
 async function main(args: readonly string[]): Promise<void> {
@@ -1307,6 +1490,18 @@ async function main(args: readonly string[]): Promise<void> {
   }
   if (command === "watch") {
     await runWatch(parseWatch(args.slice(1)));
+    return;
+  }
+  if (command === "harvest" && args[1] === "install" && args.length === 2) {
+    await installHarvest();
+    return;
+  }
+  if (command === "harvest" && args[1] === "uninstall" && args.length === 2) {
+    await uninstallHarvest();
+    return;
+  }
+  if (command === "harvest") {
+    await runHarvestCommand(parseHarvest(args.slice(1)));
     return;
   }
   if (command === "hook" && args[1] === "session-start" && args.length === 2) {

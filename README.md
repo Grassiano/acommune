@@ -78,3 +78,13 @@ The `UserPromptSubmit` hook adds a bounded, sanitized digest of new bus activity
 - `acommune watch uninstall` stops the launchd agent and removes its plist.
 
 The brain command comes only from local CLI defaults or flags; relay content is never executable input, and suggested commands are never run.
+
+## Harvest (bus → vault memory)
+
+`acommune harvest` folds new `knowledge` messages into append-only monthly notes under `<vault>/acommune/`, with stable Obsidian block links, a local cursor, and a first-harvest-order `README.md` index. The first run intentionally backfills the room.
+
+- Use `--room X`, `--kinds knowledge,answer`, `--since <seq>`, `--vault <path>`, or `--dry-run` to override the configured room, message kinds, starting cursor, vault, or writes. The vault defaults to `vault_path` in `~/.acommune/config.json`, then `~/Documents/Vault Guy`.
+- `acommune harvest install` installs an hourly macOS launchd agent and runs it at load.
+- `acommune harvest uninstall` stops the agent and removes its plist.
+
+Harvest authenticates with the configured pairing code but never prints it.
