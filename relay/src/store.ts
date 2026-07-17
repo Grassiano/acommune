@@ -674,15 +674,16 @@ export class RelayStore {
   ): RoomDigest {
     const room = this.#authenticatePairingCode(roomId, pairingCode);
     const nowIso = new Date(now).toISOString();
+    const sessionCutoffIso = new Date(now - 60 * 60 * 1_000).toISOString();
     const sessionRows = this.#database
       .prepare(
         `SELECT session_name, last_seen
            FROM sessions
-          WHERE room_id = ?
+          WHERE room_id = ? AND last_seen >= ?
           ORDER BY session_name
           LIMIT 5000`,
       )
-      .all(roomId) as SessionDigestRow[];
+      .all(roomId, sessionCutoffIso) as SessionDigestRow[];
     const claimRows = this.#database
       .prepare(
         `SELECT session_name, path, claim_seq, refreshed_at, expires_at

@@ -9,6 +9,7 @@
   },
   "scripts": {
     "build": "tsc -b",
+    "test": "npm run build && tsc --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes --types node --rootDir . --outDir .test-dist --declaration false --declarationMap false --sourceMap false test/*.ts && node --test .test-dist/test/*.test.js",
     "start": "node dist/server.js"
   },
   "dependencies": {

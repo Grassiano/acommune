@@ -1256,6 +1256,7 @@ describe("relay HTTP protocol", () => {
     try {
       const room = await createRoom(harness);
       const alice = await joinRoom(harness, room.name, "alice");
+      await joinRoom(harness, room.name, "bob");
       await sync(harness, room.name, "alice", alice.reclaim_token, {
         outbox: [
           { kind: "claim", body: { files: ["relay/src/"] } },
@@ -1263,6 +1264,17 @@ describe("relay HTTP protocol", () => {
         ],
         wait_seconds: 0,
       });
+      const database = openDatabase(harness.dbPath);
+      database
+        .prepare(
+          "UPDATE sessions SET last_seen = ? WHERE room_id = ? AND session_name = ?",
+        )
+        .run(
+          new Date(Date.now() - 2 * 60 * 60 * 1_000).toISOString(),
+          room.room_id,
+          "bob",
+        );
+      database.close();
       const digest = await jsonRequest<{
         room: string;
         verified: boolean;
@@ -1276,6 +1288,7 @@ describe("relay HTTP protocol", () => {
       assert.equal(digest.body.room, room.name);
       assert.equal(digest.body.verified, true);
       assert.equal(typeof digest.body.last_seq, "number");
+      assert.deepEqual(digest.body.sessions.map((session) => session.name), ["alice"]);
       assert.deepEqual(digest.body.sessions[0]?.active_claims, ["relay/src/"]);
       assert.equal(digest.body.open_tasks[0]?.summary, "write tests");
       assert.ok(Buffer.byteLength(JSON.stringify(digest.body), "utf8") <= 2_048);

@@ -2,7 +2,7 @@
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 
 import { KINDS, type Kind } from "acommune-shared";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -14,6 +14,13 @@ const relayUrl = (process.env.RELAY_URL ?? "http://127.0.0.1:4477").replace(
   "",
 );
 const sessionDirectory = join(homedir(), ".acommune");
+const configFilePath = join(sessionDirectory, "config.json");
+
+const acommuneConfigSchema = z.object({
+  relay: z.string().optional(),
+  room: z.string().trim().min(1),
+  code: z.string().min(1),
+});
 
 const storedSessionSchema = z.object({
   room: z.string(),
@@ -44,28 +51,103 @@ const outboxItemSchema = z.object({
   client_msg_id: z.string().min(1).max(500).optional(),
 });
 
-function sessionPath(room: string): string {
-  const safeRoom = /^[A-Za-z0-9._-]+$/.test(room)
-    ? room
-    : createHash("sha256").update(room).digest("hex");
-  return join(sessionDirectory, `${safeRoom}.session.json`);
+let activeSession: StoredSession | undefined;
+
+function safeFilePart(value: string): string {
+  return value !== "" &&
+    value !== "." &&
+    value !== ".." &&
+    /^[A-Za-z0-9._-]+$/.test(value)
+    ? value
+    : createHash("sha256").update(value).digest("hex");
+}
+
+function sessionPath(room: string, sessionName: string): string {
+  return join(
+    sessionDirectory,
+    `${safeFilePart(room)}.${safeFilePart(sessionName)}.session.json`,
+  );
+}
+
+function legacySessionPath(room: string): string {
+  return join(sessionDirectory, `${safeFilePart(room)}.session.json`);
+}
+
+function isMissingFile(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: unknown }).code === "ENOENT"
+  );
+}
+
+async function readStoredSession(path: string, room: string): Promise<StoredSession> {
+  const raw = await readFile(path, "utf8");
+  const parsed = storedSessionSchema.parse(JSON.parse(raw) as unknown);
+  if (parsed.room !== room) {
+    throw new Error("Stored session does not match this room");
+  }
+  return parsed;
+}
+
+async function loadJoinSession(
+  room: string,
+  sessionName: string,
+): Promise<StoredSession | undefined> {
+  try {
+    const session = await readStoredSession(sessionPath(room, sessionName), room);
+    if (session.session_name !== sessionName) {
+      throw new Error("Stored session does not match this session name");
+    }
+    return session;
+  } catch (error: unknown) {
+    if (!isMissingFile(error)) throw error;
+  }
+
+  try {
+    const legacySession = await readStoredSession(legacySessionPath(room), room);
+    return legacySession.session_name === sessionName ? legacySession : undefined;
+  } catch (error: unknown) {
+    if (isMissingFile(error)) return undefined;
+    throw error;
+  }
 }
 
 async function loadSession(room: string): Promise<StoredSession> {
+  if (activeSession?.room === room) {
+    return activeSession;
+  }
+
+  const safeRoom = safeFilePart(room);
+  const legacyFilename = `${safeRoom}.session.json`;
+  let filenames: string[];
   try {
-    const raw = await readFile(sessionPath(room), "utf8");
-    const parsed = storedSessionSchema.parse(JSON.parse(raw) as unknown);
-    if (parsed.room !== room) {
-      throw new Error("Stored session does not match this room");
-    }
-    return parsed;
+    filenames = await readdir(sessionDirectory);
   } catch (error: unknown) {
-    if (
-      typeof error === "object" &&
-      error !== null &&
-      "code" in error &&
-      (error as { code?: unknown }).code === "ENOENT"
-    ) {
+    if (!isMissingFile(error)) throw error;
+    filenames = [];
+  }
+  const sessionFilenames = filenames.filter(
+    (filename) =>
+      filename !== legacyFilename &&
+      filename.startsWith(`${safeRoom}.`) &&
+      filename.endsWith(".session.json"),
+  );
+  if (sessionFilenames.length > 1) {
+    throw new Error(
+      `Multiple local sessions found for room ${room}; call bus_join again with an explicit session_name`,
+    );
+  }
+  const sessionFilename = sessionFilenames[0];
+  if (sessionFilename !== undefined) {
+    return await readStoredSession(join(sessionDirectory, sessionFilename), room);
+  }
+
+  try {
+    return await readStoredSession(legacySessionPath(room), room);
+  } catch (error: unknown) {
+    if (isMissingFile(error)) {
       throw new Error(`No local session for room ${room}; call bus_join first`);
     }
     throw error;
@@ -73,7 +155,7 @@ async function loadSession(room: string): Promise<StoredSession> {
 }
 
 async function saveSession(session: StoredSession): Promise<void> {
-  const destination = sessionPath(session.room);
+  const destination = sessionPath(session.room, session.session_name);
   const temporary = `${destination}.${process.pid}.tmp`;
   await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
   await writeFile(temporary, `${JSON.stringify(session, null, 2)}\n`, {
@@ -81,6 +163,54 @@ async function saveSession(session: StoredSession): Promise<void> {
     mode: 0o600,
   });
   await rename(temporary, destination);
+}
+
+async function loadAcommuneConfig(): Promise<z.infer<typeof acommuneConfigSchema>> {
+  let raw: string;
+  try {
+    raw = await readFile(configFilePath, "utf8");
+  } catch (error: unknown) {
+    if (isMissingFile(error)) {
+      throw new Error(
+        `No acommune config found at ${configFilePath}; pass room and pairing_code explicitly`,
+      );
+    }
+    throw new Error(`Could not read acommune config at ${configFilePath}`);
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    throw new Error(`Acommune config at ${configFilePath} is not valid JSON`);
+  }
+  const result = acommuneConfigSchema.safeParse(parsed);
+  if (!result.success) {
+    throw new Error(
+      `Acommune config at ${configFilePath} must contain non-empty room and code fields`,
+    );
+  }
+  return result.data;
+}
+
+async function resolveJoinCredentials(
+  room: string | undefined,
+  pairingCode: string | undefined,
+): Promise<{ room: string; pairingCode: string }> {
+  if (room !== undefined && pairingCode !== undefined) {
+    return { room, pairingCode };
+  }
+  const config = await loadAcommuneConfig();
+  const resolvedRoom = room ?? config.room;
+  if (pairingCode !== undefined) {
+    return { room: resolvedRoom, pairingCode };
+  }
+  if (room !== undefined && room !== config.room) {
+    throw new Error(
+      `Acommune config is for room ${config.room}; pass pairing_code explicitly for room ${room}`,
+    );
+  }
+  return { room: resolvedRoom, pairingCode: config.code };
 }
 
 function errorMessage(payload: unknown, status: number): string {
@@ -157,49 +287,49 @@ const server = new McpServer({ name: "acommune", version: "0.1.0" });
 server.registerTool(
   "bus_join",
   {
-    description: "Create or join a named acommune room and reserve a session name",
+    description:
+      "Create or join a named acommune room and reserve a session name; pairing_code optional — read from ~/.acommune/config.json when omitted",
     inputSchema: {
-      ...roomShape,
+      room: roomShape.room.optional(),
       session_name: z.string().trim().min(1).max(200),
-      pairing_code: z.string().min(6),
+      pairing_code: z.string().min(6).optional(),
     },
   },
   async ({ room, session_name, pairing_code }) => {
     try {
-      let reclaimToken: string | undefined;
-      try {
-        const existing = await loadSession(room);
-        if (existing.session_name === session_name) {
-          reclaimToken = existing.reclaim_token;
-        }
-      } catch {
-        // A missing or unreadable local credential means this is a fresh join.
-      }
+      const credentials = await resolveJoinCredentials(room, pairing_code);
+      const existing = await loadJoinSession(credentials.room, session_name);
+      const reclaimToken = existing?.reclaim_token;
       const requestBody = {
         session_name,
-        pairing_code,
+        pairing_code: credentials.pairingCode,
         ...(reclaimToken === undefined ? {} : { reclaim_token: reclaimToken }),
       };
       const roomPayload = await relayFetch("/rooms", {
         method: "POST",
-        body: JSON.stringify({ name: room, pairing_code }),
+        body: JSON.stringify({
+          name: credentials.room,
+          pairing_code: credentials.pairingCode,
+        }),
       });
       roomResponseSchema.parse(roomPayload);
       const payload = await relayFetch(
-        `/rooms/${encodeURIComponent(room)}/join`,
+        `/rooms/${encodeURIComponent(credentials.room)}/join`,
         { method: "POST", body: JSON.stringify(requestBody) },
       );
       const joined = joinResponseSchema.parse(payload);
-      await saveSession({
-        room,
+      const session = {
+        room: credentials.room,
         session_name,
         reclaim_token: joined.reclaim_token,
-      });
+      };
+      await saveSession(session);
+      activeSession = session;
       return {
         content: [
           {
             type: "text" as const,
-            text: `Joined ${room} as ${session_name}; identity saved locally.`,
+            text: `Joined ${credentials.room} as ${session_name}; identity saved locally.`,
           },
         ],
       };
