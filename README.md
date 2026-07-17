@@ -64,7 +64,9 @@ After joining a room and creating `~/.acommune/config.json`, install the Claude 
 acommune hooks install
 ```
 
-Use `--project <dir>` to target another project or `--user` to install the hooks in `~/.claude/settings.json`. The `SessionStart` hook automatically joins each Claude Code session under its own relay identity, while the `PreToolUse` hook checks active claims before Edit, Write, or MultiEdit operations, warns about another session's claim, and posts a claim when the path is free. Both hooks fail open by design: configuration, filesystem, relay, timeout, or parsing failures never block a session or an edit.
+Use `--project <dir>` to target another project or `--user` to install the hooks in `~/.claude/settings.json`. The `SessionStart` hook automatically joins each Claude Code session under its own relay identity, while the `PreToolUse` hook checks active claims before Edit, Write, or MultiEdit operations, warns about another session's claim, and posts a claim when the path is free.
+
+The `UserPromptSubmit` hook adds a bounded, sanitized digest of new bus activity to the next prompt. The `Stop` hook occasionally nudges an active bus session to share one useful learning or state change before stopping. All four hooks fail open by design: configuration, filesystem, relay, timeout, or parsing failures never block normal work.
 
 ## Watch (answer-only worker)
 

@@ -77,7 +77,7 @@ function isKind(value: unknown): value is Kind {
   return typeof value === "string" && kindSet.has(value);
 }
 
-function messageFrom(value: unknown): Message | undefined {
+export function messageFrom(value: unknown): Message | undefined {
   if (
     !isJsonObject(value) ||
     typeof value.seq !== "number" ||
