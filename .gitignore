@@ -6,3 +6,6 @@ dist
 *.sqlite-*
 # Home-directory credentials live outside this repository; ignore accidental local copies.
 .acommune/
+
+# local MCP registration (created by acommune join smoke tests)
+.mcp.json
