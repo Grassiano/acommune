@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { randomBytes } from "node:crypto";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -14,7 +15,14 @@ import {
   unlink,
   writeFile,
 } from "node:fs/promises";
-import { KINDS, type Kind, type Message } from "acommune-shared";
+import {
+  decodeInvite,
+  encodeInvite,
+  KINDS,
+  type Invite,
+  type Kind,
+  type Message,
+} from "acommune-shared";
 import {
   isJsonObject,
   isSafeFilePart,
@@ -46,7 +54,10 @@ const DEFAULT_BRAIN_COMMAND = "claude -p --permission-mode plan";
 const WATCH_LABEL = "com.acommune.watch";
 const HARVEST_LABEL = "com.acommune.harvest";
 const USAGE = `Usage:
+  acommune create <room> [--relay <url>] [--force]
+  acommune join <token> [--force]
   acommune join <room> --code <code> [--relay <url>] [--name <session_name>] [--config <path>]
+  acommune rotate [--room X]
   acommune hooks install [--project <dir> | --user]
   acommune watch [--room X] [--triggers question,handoff] [--poll-seconds 5] [--cooldown 60] [--max-per-day 50] [--brain-cmd <cmd>] [--name worker]
   acommune watch status
@@ -65,6 +76,21 @@ interface JoinOptions {
   relay: string;
   name?: string;
   config?: string;
+}
+
+interface CreateOptions {
+  room: string;
+  relay?: string;
+  force: boolean;
+}
+
+interface TokenJoinOptions {
+  token: string;
+  force: boolean;
+}
+
+interface RotateOptions {
+  room?: string;
 }
 
 interface HooksInstallOptions {
@@ -112,6 +138,8 @@ interface ActiveClaim {
 }
 
 class CliError extends Error {}
+
+class ExactCliError extends CliError {}
 
 function expandHome(path: string): string {
   if (path === "~") return homedir();
@@ -213,6 +241,98 @@ function parseJoin(args: readonly string[]): JoinOptions {
     ...(name === undefined ? {} : { name }),
     ...(config === undefined ? {} : { config }),
   };
+}
+
+function parseRelay(value: string): string {
+  let relayUrl: URL;
+  try {
+    relayUrl = new URL(value);
+  } catch {
+    throw new CliError(`Invalid relay URL: ${value}`);
+  }
+  if (relayUrl.protocol !== "http:" && relayUrl.protocol !== "https:") {
+    throw new CliError("Relay URL must start with http:// or https://.");
+  }
+  return value.replace(/\/+$/, "");
+}
+
+function parseCreate(args: readonly string[]): CreateOptions {
+  const requestedRoom = args[0];
+  if (requestedRoom === undefined || requestedRoom.startsWith("-")) {
+    throw new CliError("create needs a room name.");
+  }
+  const room = requestedRoom.trim();
+  if (room === "") throw new CliError("Room name cannot be empty.");
+
+  let relay: string | undefined;
+  let force = false;
+  for (let index = 1; index < args.length; index += 1) {
+    const argument = args[index]!;
+    const equals = argument.indexOf("=");
+    const flag = equals === -1 ? argument : argument.slice(0, equals);
+    const inlineValue = equals === -1 ? undefined : argument.slice(equals + 1);
+    if (flag === "--relay") {
+      const value = inlineValue === undefined
+        ? readFlagValue(args, index++, flag)
+        : inlineValue;
+      if (value === "") throw new CliError("--relay needs a value.");
+      relay = parseRelay(value);
+      continue;
+    }
+    if (argument === "--force") {
+      force = true;
+      continue;
+    }
+    throw new CliError(
+      argument.startsWith("-")
+        ? `Unknown option: ${argument}`
+        : `Unexpected argument: ${argument}`,
+    );
+  }
+  return { room, ...(relay === undefined ? {} : { relay }), force };
+}
+
+function parseTokenJoin(args: readonly string[]): TokenJoinOptions {
+  const token = args[0];
+  if (token === undefined) throw new CliError("join needs an invite token.");
+  let force = false;
+  for (const argument of args.slice(1)) {
+    if (argument === "--force") {
+      force = true;
+      continue;
+    }
+    throw new CliError(
+      argument.startsWith("-")
+        ? `Unknown option: ${argument}`
+        : `Unexpected argument: ${argument}`,
+    );
+  }
+  return { token, force };
+}
+
+function parseRotate(args: readonly string[]): RotateOptions {
+  let room: string | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index]!;
+    const equals = argument.indexOf("=");
+    const flag = equals === -1 ? argument : argument.slice(0, equals);
+    const inlineValue = equals === -1 ? undefined : argument.slice(equals + 1);
+    if (flag === "--room") {
+      if (room !== undefined) throw new CliError("--room can only be specified once.");
+      const value = inlineValue === undefined
+        ? readFlagValue(args, index++, flag)
+        : inlineValue;
+      room = value.trim();
+      if (room === "") throw new CliError("--room cannot be empty.");
+      continue;
+    }
+    throw new CliError(
+      argument.startsWith("-")
+        ? `Unknown option: ${argument}`
+        : `Unexpected argument: ${argument}`,
+    );
+  }
+  return { ...(room === undefined ? {} : { room }) };
 }
 
 function parseHooksInstall(args: readonly string[]): HooksInstallOptions {
@@ -537,6 +657,44 @@ async function loadAcommuneConfig(): Promise<AcommuneConfig> {
   };
 }
 
+async function writeAcommuneConfig(
+  config: Invite,
+  options: { force: boolean },
+): Promise<void> {
+  const path = configPath();
+  const current = await readConfig(path);
+  if (current.exists) {
+    const existingRoom = typeof current.config.room === "string"
+      ? current.config.room
+      : "(unknown)";
+    if (existingRoom !== config.room && !options.force) {
+      throw new CliError(
+        `Existing acommune config is for room ${JSON.stringify(existingRoom)}, not ${JSON.stringify(config.room)}. Pass --force to switch rooms.`,
+      );
+    }
+  }
+
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  if (current.exists) {
+    await copyFile(path, `${path}.bak`);
+    if (current.mode !== undefined) await chmod(`${path}.bak`, current.mode);
+  }
+  const temporary = `${path}.${process.pid}.tmp`;
+  try {
+    await writeFile(
+      temporary,
+      `${JSON.stringify({ relay: config.relay, room: config.room, code: config.code }, null, 2)}\n`,
+      { encoding: "utf8", mode: 0o600 },
+    );
+    await rename(temporary, path);
+    await chmod(path, 0o600);
+  } catch (error: unknown) {
+    throw new CliError(
+      `Could not write config ${path}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
 function resolveCliEntry(): string {
   // Hooks run without relying on PATH, so point Node at this built module itself.
   return resolve(dirname(fileURLToPath(import.meta.url)), "cli.js");
@@ -688,6 +846,22 @@ function relayErrorCode(value: JsonObject): string | undefined {
   return isJsonObject(value.error) && typeof value.error.code === "string"
     ? value.error.code
     : undefined;
+}
+
+function relayFailure(response: Response, value: JsonObject): CliError {
+  return new CliError(
+    `Relay request failed with HTTP ${response.status}: ${JSON.stringify(value)}`,
+  );
+}
+
+async function cliResponseJson(response: Response): Promise<JsonObject> {
+  try {
+    return await responseJson(response);
+  } catch (error: unknown) {
+    throw new CliError(
+      `Relay returned invalid JSON with HTTP ${response.status}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }
 
 function sessionIdentityPath(room: string, sessionId: string): string {
@@ -1187,10 +1361,15 @@ async function rememberRoom(room: string, relay: string): Promise<void> {
   await chmod(roomsPath, 0o600);
 }
 
-async function joinRoom(options: JoinOptions): Promise<void> {
-  const configPath = await resolveConfigPath(options.config);
+async function configureMcpServer(relay: string, override?: string): Promise<string> {
+  const targetPath = await resolveConfigPath(override);
   const mcpServerPath = await resolveMcpServer();
-  await writeConfig(configPath, mcpServerPath, options.relay);
+  await writeConfig(targetPath, mcpServerPath, relay);
+  return targetPath;
+}
+
+async function joinRoom(options: JoinOptions): Promise<void> {
+  const targetPath = await configureMcpServer(options.relay, options.config);
   try {
     await rememberRoom(options.room, options.relay);
   } catch (error: unknown) {
@@ -1201,9 +1380,125 @@ async function joinRoom(options: JoinOptions): Promise<void> {
 
   const nameArgument = options.name === undefined ? "" : ` name=${JSON.stringify(options.name)}`;
   process.stdout.write(
-    `Added acommune to ${configPath}.\n` +
+    `Added acommune to ${targetPath}.\n` +
       `Relay: ${options.relay}\n` +
       `Restart Claude Code, then in your session run: bus_join room=${JSON.stringify(options.room)} code=${JSON.stringify(options.code)}${nameArgument}  — you'll be in #${options.room}.\n`,
+  );
+}
+
+function roomExistsWithoutCode(room: string, relay: string): ExactCliError {
+  return new ExactCliError(
+    `Room ${JSON.stringify(room)} already exists on ${relay} — I don't have its code. Get the invite from someone who has it, or if you own this relay run \`acommune rotate --room ${room}\` from a machine whose config already has the code.`,
+  );
+}
+
+async function createRoom(options: CreateOptions): Promise<void> {
+  let relay = options.relay;
+  if (relay === undefined) {
+    try {
+      relay = (await loadAcommuneConfig()).relay;
+    } catch {
+      // A missing or invalid config does not provide a safe relay default.
+    }
+  }
+  if (relay === undefined) {
+    throw new CliError(
+      "No relay known yet — pass --relay <url>; acommune does not default to a public server.",
+    );
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${relay}/rooms`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: options.room }),
+    });
+  } catch (error: unknown) {
+    throw new CliError(
+      `Could not create room on ${relay}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  const result = await cliResponseJson(response);
+  if (response.status === 409 && relayErrorCode(result) === "ROOM_NAME_TAKEN") {
+    throw roomExistsWithoutCode(options.room, relay);
+  }
+  if (!response.ok) throw relayFailure(response, result);
+  if (!("pairing_code" in result)) {
+    throw roomExistsWithoutCode(options.room, relay);
+  }
+  if (typeof result.pairing_code !== "string" || result.pairing_code.length < 6) {
+    throw new CliError("Relay returned an invalid pairing_code for the new room.");
+  }
+
+  const code = result.pairing_code;
+  await writeAcommuneConfig(
+    { relay, room: options.room, code },
+    { force: options.force },
+  );
+  const token = encodeInvite({ relay, room: options.room, code });
+  process.stdout.write(
+    `Room ${JSON.stringify(options.room)} ready.\n` +
+      `Board: ${relay}/board#room=${options.room}&code=${code}\n` +
+      `Invite (share this line): npx acommune join ${token}\n` +
+      "The invite carries the room code. Share it like a password.\n",
+  );
+}
+
+async function joinInvite(options: TokenJoinOptions): Promise<void> {
+  let invite: Invite;
+  try {
+    invite = decodeInvite(options.token);
+  } catch (error: unknown) {
+    throw new CliError(error instanceof Error ? error.message : String(error));
+  }
+  await writeAcommuneConfig(invite, { force: options.force });
+  await configureMcpServer(invite.relay);
+  process.stdout.write(
+    `Joined ${JSON.stringify(invite.room)}. Run /bus in a session, or the hooks will auto-join new sessions.\n`,
+  );
+}
+
+async function rotateRoom(options: RotateOptions): Promise<void> {
+  const config = await loadAcommuneConfig();
+  if (options.room !== undefined && options.room !== config.room) {
+    throw new CliError(
+      `Config is for room ${JSON.stringify(config.room)}, not ${JSON.stringify(options.room)} — switch rooms first.`,
+    );
+  }
+
+  const newCode = randomBytes(16).toString("hex");
+  let response: Response;
+  try {
+    response = await fetch(
+      `${config.relay}/rooms/${encodeURIComponent(config.room)}/rotate-code`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-acommune-code": config.code,
+        },
+        body: JSON.stringify({ new_code: newCode }),
+      },
+    );
+  } catch (error: unknown) {
+    throw new CliError(
+      `Could not rotate the room code: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  const result = await cliResponseJson(response);
+  if (!response.ok) throw relayFailure(response, result);
+  if (result.ok !== true) throw new CliError("Relay returned an invalid rotate-code response.");
+
+  await writeAcommuneConfig(
+    { relay: config.relay, room: config.room, code: newCode },
+    { force: true },
+  );
+  const token = encodeInvite({ relay: config.relay, room: config.room, code: newCode });
+  process.stdout.write(
+    `Rotated code for ${JSON.stringify(config.room)}.\n` +
+      `Board: ${config.relay}/board#room=${config.room}&code=${newCode}\n` +
+      `Invite (share this line): npx acommune join ${token}\n`,
   );
 }
 
@@ -1468,8 +1763,20 @@ async function main(args: readonly string[]): Promise<void> {
     process.stdout.write(`${await readVersion()}\n`);
     return;
   }
+  if (command === "create") {
+    await createRoom(parseCreate(args.slice(1)));
+    return;
+  }
   if (command === "join") {
+    if (args[1]?.startsWith("acm1_") === true) {
+      await joinInvite(parseTokenJoin(args.slice(1)));
+      return;
+    }
     await joinRoom(parseJoin(args.slice(1)));
+    return;
+  }
+  if (command === "rotate") {
+    await rotateRoom(parseRotate(args.slice(1)));
     return;
   }
   if (command === "hooks" && args[1] === "install") {
@@ -1525,6 +1832,10 @@ async function main(args: readonly string[]): Promise<void> {
 
 main(process.argv.slice(2)).catch((error: unknown) => {
   const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`Error: ${message}\n\n${USAGE}\n`);
+  if (error instanceof ExactCliError) {
+    process.stderr.write(`${message}\n`);
+  } else {
+    process.stderr.write(`Error: ${message}\n\n${USAGE}\n`);
+  }
   process.exitCode = 1;
 });

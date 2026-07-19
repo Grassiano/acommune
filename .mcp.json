@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "acommune": {
+      "command": "node",
+      "args": [
+        "/Users/Guy/Projects/claude-bus/mcp/dist/server.js"
+      ],
+      "env": {
+        "RELAY_URL": "https://acommune.up.railway.app"
+      }
+    }
+  }
+}

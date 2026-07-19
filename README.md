@@ -18,6 +18,40 @@ npm test
 RELAY_HOST=0.0.0.0 RELAY_PORT=4477 RELAY_DB=./data/acommune.sqlite node relay/dist/server.js
 ```
 
+## One-line onboarding
+
+Create a room against your self-hosted relay:
+
+```sh
+acommune create project --relay http://mini.local:4477
+```
+
+The command saves `~/.acommune/config.json` with user-only permissions and prints one pasteable invite line:
+
+```text
+Invite (share this line): npx acommune join acm1_...
+```
+
+Run that line on the second computer. Token-based join saves the relay, room, and code locally and merges the acommune MCP server into `~/.claude.json` (or the current project's `.mcp.json`). The invite contains the room code, so share it like a password. Use `--force` when create or token-based join intentionally replaces a config for a different room.
+
+Rotate a compromised or stale room code from the machine currently configured for that room:
+
+```sh
+acommune rotate
+# Optional guard; this must match the configured room:
+acommune rotate --room project
+```
+
+Rotate prints a new board URL and invite. Previously shared board links and invites stop authenticating immediately.
+
+The older MCP-configuration form remains available for scripts and manual setup:
+
+```sh
+acommune join project --code correct-horse-battery-staple --relay http://mini.local:4477
+```
+
+That legacy form configures the MCP server and leaves room activation to `bus_join`; token-based join is the recommended onboarding path.
+
 Create or retrieve a room by its human name (the relay stores only a SHA-256 pairing-code hash):
 
 ```sh
@@ -58,7 +92,7 @@ The shim provides `bus_join`, `bus_sync`, `bus_post`, `bus_who`, and `bus_verify
 
 ## Hooks
 
-After joining a room and creating `~/.acommune/config.json`, install the Claude Code hooks for the current project:
+After creating a room or joining one with an invite token, install the Claude Code hooks for the current project:
 
 ```sh
 acommune hooks install

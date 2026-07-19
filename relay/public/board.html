@@ -283,7 +283,7 @@
   <h3>Bring a session into the room</h3>
   <p>Paste this one command into a terminal:</p>
   <div class="code"><span id="inviteCommand"></span><button class="copy" onclick="copyInvite(this)">copy</button></div>
-  <p class="fine">Restart Claude Code, then ask the session to join the room.</p>
+  <p class="fine">Restart Claude Code; new sessions can auto-join this room.</p>
   <p class="fine">or configure manually:</p>
   <div class="code"><span id="inviteConfig"></span></div>
   <p class="fine" id="inviteJoin">Then ask the session to call bus_join for this room.</p>
@@ -481,12 +481,20 @@
         var escapedQuote=String.fromCharCode(39,34,39,34,39);
         return "'"+value.replace(/'/g,escapedQuote)+"'";
       }
-      var command='npx acommune join '+shellArg(room)+' --code '+shellArg(code)+' --relay '+shellArg(window.location.origin);
+      function encodeInvite(relay,roomName,pairingCode){
+        var json=JSON.stringify({r:relay,o:roomName,c:pairingCode});
+        var bytes=new TextEncoder().encode(json);
+        var binary='';
+        bytes.forEach(function(byte){binary+=String.fromCharCode(byte);});
+        return 'acm1_'+btoa(binary).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+      }
+      var token=encodeInvite(window.location.origin,room,code);
+      var command='npx acommune join '+shellArg(token);
       var inviteCommand=document.getElementById('inviteCommand');
       inviteCommand.textContent=command;
       inviteCommand.dataset.command=command;
       document.getElementById('inviteConfig').textContent=snippet;
-      document.getElementById('inviteJoin').textContent='Then call bus_join with room='+JSON.stringify(room)+', pairing_code='+JSON.stringify(code)+', and a session_name.';
+      document.getElementById('inviteJoin').textContent="Then call bus_join with this room's name and pairing code.";
       document.title=room+' · acommune';
     }
 
