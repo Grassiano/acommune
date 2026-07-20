@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmod,
   mkdir,
@@ -51,6 +52,39 @@ const fetchMockPath = resolve(process.cwd(), ".test-dist/test/fetch-mock.js");
 const directories: string[] = [];
 const servers: Server[] = [];
 let relayNumber = 0;
+const projectCwd = "/Users/tester/project";
+
+function stableSessionKey(cwd: string): string {
+  return createHash("sha256")
+    .update(resolve(cwd).replace(/\\/g, "/"))
+    .digest("hex")
+    .slice(0, 16);
+}
+
+function identityFilePath(directory: string, cwd: string, room = "demo"): string {
+  return join(
+    directory,
+    ".acommune",
+    "sessions",
+    `${room}.${stableSessionKey(cwd)}.json`,
+  );
+}
+
+function promptCursorFilePath(directory: string, cwd: string, room = "demo"): string {
+  return join(
+    directory,
+    ".acommune",
+    `prompt-cursor-${room}.${stableSessionKey(cwd)}.json`,
+  );
+}
+
+function nudgeStatePath(directory: string, cwd: string, room = "demo"): string {
+  return join(
+    directory,
+    ".acommune",
+    `nudge-${room}.${stableSessionKey(cwd)}.json`,
+  );
+}
 
 async function tempDirectory(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "acommune-hooks-test-"));
@@ -216,12 +250,12 @@ async function writeConfig(
 async function writeIdentity(
   directory: string,
   relay: string,
-  sessionId: string,
+  cwd: string,
   room = "demo",
 ): Promise<string> {
   const sessionsDirectory = join(directory, ".acommune", "sessions");
   await mkdir(sessionsDirectory, { recursive: true, mode: 0o700 });
-  const path = join(sessionsDirectory, `${room}.${sessionId}.json`);
+  const path = identityFilePath(directory, cwd, room);
   await writeFile(
     path,
     `${JSON.stringify({
@@ -274,15 +308,11 @@ function relayMessage(
 
 async function writePromptCursor(
   directory: string,
-  sessionId: string,
+  cwd: string,
   afterSeq: number,
   room = "demo",
 ): Promise<string> {
-  const path = join(
-    directory,
-    ".acommune",
-    `prompt-cursor-${room}.${sessionId}.json`,
-  );
+  const path = promptCursorFilePath(directory, cwd, room);
   await writeFile(path, `${JSON.stringify({ after_seq: afterSeq })}\n`, "utf8");
   return path;
 }
@@ -398,7 +428,7 @@ describe("acommune hook session-start", () => {
     const result = await runCli(
       directory,
       ["hook", "session-start"],
-      { session_id: "session-1", cwd: "/Users/tester/project" },
+      { session_id: "session-1", cwd: projectCwd },
       relay.environment,
     );
 
@@ -410,12 +440,7 @@ describe("acommune hook session-start", () => {
     assert.deepEqual(joinRequests, [
       { session_name: "cc-project", pairing_code: "pairing-code" },
     ]);
-    const identityPath = join(
-      directory,
-      ".acommune",
-      "sessions",
-      "demo.session-1.json",
-    );
+    const identityPath = identityFilePath(directory, projectCwd);
     assert.deepEqual(await jsonObject(identityPath), {
       session_name: "cc-project",
       reclaim_token: "token-one",
@@ -424,6 +449,81 @@ describe("acommune hook session-start", () => {
     });
     assert.equal((await stat(identityPath)).mode & 0o777, 0o600);
     assert.equal((await stat(join(directory, ".acommune", "sessions"))).mode & 0o777, 0o700);
+  });
+
+  it("reclaims the same identity when Claude changes session_id in the same cwd", async () => {
+    const directory = await tempDirectory();
+    const requests: JsonObject[] = [];
+    const relay = await fakeRelay(directory, async (request, response) => {
+      requests.push(await requestJson(request));
+      sendJson(response, 200, { reclaim_token: "token-one", cursor: 3 });
+    }, [{ body: { reclaim_token: "token-one", cursor: 3 } }]);
+    await writeConfig(directory, relay.url);
+
+    const first = await runCli(
+      directory,
+      ["hook", "session-start"],
+      { session_id: "account-a", cwd: projectCwd },
+      relay.environment,
+    );
+    const second = await runCli(
+      directory,
+      ["hook", "session-start"],
+      { session_id: "account-b", cwd: projectCwd },
+      relay.environment,
+    );
+
+    assert.deepEqual(first, { code: 0, stdout: "", stderr: "" });
+    assert.deepEqual(second, { code: 0, stdout: "", stderr: "" });
+    const recorded = await relay.requests();
+    const joinRequests = requests.length > 0
+      ? requests
+      : recorded.map((request) => request.body).filter(isJsonObject);
+    assert.deepEqual(joinRequests, [
+      { session_name: "cc-project", pairing_code: "pairing-code" },
+      {
+        session_name: "cc-project",
+        pairing_code: "pairing-code",
+        reclaim_token: "token-one",
+      },
+    ]);
+    assert.deepEqual(await jsonObject(identityFilePath(directory, projectCwd)), {
+      session_name: "cc-project",
+      reclaim_token: "token-one",
+      room: "demo",
+      relay: relay.url,
+    });
+  });
+
+  it("keeps identities isolated between different cwd values", async () => {
+    const directory = await tempDirectory();
+    const firstCwd = "/Users/tester/project-one";
+    const secondCwd = "/Users/tester/project-two";
+    const relay = await fakeRelay(directory, (_request, response) => {
+      sendJson(response, 200, { reclaim_token: "token", cursor: 0 });
+    }, [{ body: { reclaim_token: "token", cursor: 0 } }]);
+    await writeConfig(directory, relay.url);
+
+    const first = await runCli(
+      directory,
+      ["hook", "session-start"],
+      { session_id: "same-claude-id", cwd: firstCwd },
+      relay.environment,
+    );
+    const second = await runCli(
+      directory,
+      ["hook", "session-start"],
+      { session_id: "same-claude-id", cwd: secondCwd },
+      relay.environment,
+    );
+
+    assert.deepEqual(first, { code: 0, stdout: "", stderr: "" });
+    assert.deepEqual(second, { code: 0, stdout: "", stderr: "" });
+    const firstPath = identityFilePath(directory, firstCwd);
+    const secondPath = identityFilePath(directory, secondCwd);
+    assert.notEqual(firstPath, secondPath);
+    assert.equal((await jsonObject(firstPath)).session_name, "cc-project-one");
+    assert.equal((await jsonObject(secondPath)).session_name, "cc-project-two");
   });
 
   it("skips sessions whose cwd is under a system temp root", async () => {
@@ -449,12 +549,7 @@ describe("acommune hook session-start", () => {
     assert.equal(requestCount, 0);
     assert.deepEqual(await relay.requests(), []);
     await assert.rejects(
-      readFile(join(
-        directory,
-        ".acommune",
-        "sessions",
-        "demo.session-private-tmp.json",
-      )),
+      readFile(identityFilePath(directory, "/private/tmp/cc-tmp.omaLx76bsP/project")),
     );
   });
 
@@ -478,12 +573,7 @@ describe("acommune hook session-start", () => {
     assert.equal(requestCount, 0);
     assert.deepEqual(await relay.requests(), []);
     await assert.rejects(
-      readFile(join(
-        directory,
-        ".acommune",
-        "sessions",
-        "demo.session-tmp-basename.json",
-      )),
+      readFile(identityFilePath(directory, "/Users/tester/tmp.abc123")),
     );
   });
 
@@ -516,11 +606,9 @@ describe("acommune hook session-start", () => {
     assert.deepEqual(joinRequests, [
       { session_name: "cc-project", pairing_code: "pairing-code" },
     ]);
-    const identityPath = join(
+    const identityPath = identityFilePath(
       directory,
-      ".acommune",
-      "sessions",
-      "demo.session-temp-enabled.json",
+      "/private/tmp/cc-tmp.override/project",
     );
     assert.deepEqual(await jsonObject(identityPath), {
       session_name: "cc-project",
@@ -558,7 +646,7 @@ describe("acommune hook session-start", () => {
     const result = await runCli(
       directory,
       ["hook", "session-start"],
-      { session_id: "session-2", cwd: "/Users/tester/project" },
+      { session_id: "session-2", cwd: projectCwd },
       relay.environment,
     );
 
@@ -572,10 +660,64 @@ describe("acommune hook session-start", () => {
             : [],
         );
     assert.deepEqual(joinedNames, ["cc-project", "cc-project-2"]);
-    const identity = await jsonObject(
-      join(directory, ".acommune", "sessions", "demo.session-2.json"),
-    );
+    const identity = await jsonObject(identityFilePath(directory, projectCwd));
     assert.equal(identity.session_name, "cc-project-2");
+  });
+
+  it("falls back to a fresh suffixed name when reclaim is rejected", async () => {
+    const directory = await tempDirectory();
+    const requests: JsonObject[] = [];
+    const relay = await fakeRelay(directory, async (request, response) => {
+      const body = await requestJson(request);
+      requests.push(body);
+      if (body.session_name === "cc-project") {
+        sendJson(response, 409, {
+          error: { code: "AGENT_NAME_IN_USE", message: "already in use" },
+        });
+        return;
+      }
+      sendJson(response, 200, { reclaim_token: "replacement-token", cursor: 4 });
+    }, [
+      {
+        status: 409,
+        body: { error: { code: "AGENT_NAME_IN_USE", message: "already in use" } },
+      },
+      {
+        status: 409,
+        body: { error: { code: "AGENT_NAME_IN_USE", message: "already in use" } },
+      },
+      { body: { reclaim_token: "replacement-token", cursor: 4 } },
+    ]);
+    await writeConfig(directory, relay.url);
+    await writeIdentity(directory, relay.url, projectCwd);
+
+    const result = await runCli(
+      directory,
+      ["hook", "session-start"],
+      { session_id: "after-crash", cwd: projectCwd },
+      relay.environment,
+    );
+
+    assert.deepEqual(result, { code: 0, stdout: "", stderr: "" });
+    const recorded = await relay.requests();
+    const joinRequests = requests.length > 0
+      ? requests
+      : recorded.map((request) => request.body).filter(isJsonObject);
+    assert.deepEqual(joinRequests, [
+      {
+        session_name: "cc-project",
+        pairing_code: "pairing-code",
+        reclaim_token: "r".repeat(48),
+      },
+      { session_name: "cc-project", pairing_code: "pairing-code" },
+      { session_name: "cc-project-2", pairing_code: "pairing-code" },
+    ]);
+    assert.deepEqual(await jsonObject(identityFilePath(directory, projectCwd)), {
+      session_name: "cc-project-2",
+      reclaim_token: "replacement-token",
+      room: "demo",
+      relay: relay.url,
+    });
   });
 
   it("fails open and silently when the relay is unreachable", async () => {
@@ -586,13 +728,13 @@ describe("acommune hook session-start", () => {
     const result = await runCli(
       directory,
       ["hook", "session-start"],
-      { session_id: "session-down", cwd: "/Users/tester/project" },
+      { session_id: "session-down", cwd: projectCwd },
       relay.environment,
     );
 
     assert.deepEqual(result, { code: 0, stdout: "", stderr: "" });
     await assert.rejects(
-      readFile(join(directory, ".acommune", "sessions", "demo.session-down.json")),
+      readFile(identityFilePath(directory, projectCwd)),
     );
   });
 });
@@ -611,18 +753,18 @@ describe("acommune hook prompt-context", () => {
       sendJson(response, 200, responseBody);
     }, [{ body: responseBody }]);
     await writeConfig(directory, relay.url);
-    await writeIdentity(directory, relay.url, "prompt-first");
+    await writeIdentity(directory, relay.url, projectCwd);
 
     const result = await runCli(
       directory,
       ["hook", "prompt-context"],
-      { session_id: "prompt-first", cwd: "/Users/tester/project" },
+      { session_id: "prompt-first", cwd: projectCwd },
       relay.environment,
     );
 
     assert.deepEqual(result, { code: 0, stdout: "", stderr: "" });
     assert.deepEqual(
-      await jsonObject(join(directory, ".acommune", "prompt-cursor-demo.prompt-first.json")),
+      await jsonObject(promptCursorFilePath(directory, projectCwd)),
       { after_seq: 12 },
     );
     const recorded = await relay.requests();
@@ -638,7 +780,53 @@ describe("acommune hook prompt-context", () => {
     );
   });
 
-  it("prints only new messages from others, advances, and does not re-show them", async () => {
+  it("keeps prompt cursors isolated between different cwd values", async () => {
+    const directory = await tempDirectory();
+    const firstCwd = "/Users/tester/project-one";
+    const secondCwd = "/Users/tester/project-two";
+    const urls: string[] = [];
+    const responseBody = {
+      messages: [relayMessage(6, "worker", "progress", { summary: "new update" })],
+      last_seq: 6,
+    };
+    const relay = await fakeRelay(directory, (request, response) => {
+      urls.push(request.url ?? "");
+      sendJson(response, 200, responseBody);
+    }, [{ body: responseBody }]);
+    await writeConfig(directory, relay.url);
+    await writeIdentity(directory, relay.url, firstCwd);
+    await writeIdentity(directory, relay.url, secondCwd);
+    await writePromptCursor(directory, firstCwd, 5);
+
+    const first = await runCli(
+      directory,
+      ["hook", "prompt-context"],
+      { session_id: "shared-id", cwd: firstCwd },
+      relay.environment,
+    );
+    const second = await runCli(
+      directory,
+      ["hook", "prompt-context"],
+      { session_id: "shared-id", cwd: secondCwd },
+      relay.environment,
+    );
+
+    assert.match(first.stdout, /new update/);
+    assert.deepEqual(second, { code: 0, stdout: "", stderr: "" });
+    const recorded = await relay.requests();
+    const observedUrls = urls.length > 0 ? urls : recorded.map((request) => request.url);
+    assert.deepEqual(
+      observedUrls.map((value) => new URL(value, relay.url).searchParams.get("after_seq")),
+      ["5", "0"],
+    );
+    const firstPath = promptCursorFilePath(directory, firstCwd);
+    const secondPath = promptCursorFilePath(directory, secondCwd);
+    assert.notEqual(firstPath, secondPath);
+    assert.deepEqual(await jsonObject(firstPath), { after_seq: 6 });
+    assert.deepEqual(await jsonObject(secondPath), { after_seq: 6 });
+  });
+
+  it("persists its cursor across a session_id change in the same cwd", async () => {
     const directory = await tempDirectory();
     const newMessages = [
       relayMessage(6, "cc-project", "progress", { summary: "self update" }),
@@ -652,13 +840,13 @@ describe("acommune hook prompt-context", () => {
       sendJson(response, 200, url.searchParams.get("after_seq") === "8" ? emptyBody : responseBody);
     }, [{ body: responseBody }]);
     await writeConfig(directory, relay.url);
-    await writeIdentity(directory, relay.url, "prompt-next");
-    const cursorPath = await writePromptCursor(directory, "prompt-next", 5);
+    await writeIdentity(directory, relay.url, projectCwd);
+    const cursorPath = await writePromptCursor(directory, projectCwd, 5);
 
     const result = await runCli(
       directory,
       ["hook", "prompt-context"],
-      { session_id: "prompt-next", cwd: "/Users/tester/project" },
+      { session_id: "prompt-next", cwd: projectCwd },
       relay.environment,
     );
 
@@ -682,7 +870,7 @@ describe("acommune hook prompt-context", () => {
     const repeated = await runCli(
       directory,
       ["hook", "prompt-context"],
-      { session_id: "prompt-next", cwd: "/Users/tester/project" },
+      { session_id: "prompt-next-account-switch", cwd: projectCwd },
       repeatEnvironment,
     );
     assert.deepEqual(repeated, { code: 0, stdout: "", stderr: "" });
@@ -701,13 +889,13 @@ describe("acommune hook prompt-context", () => {
       sendJson(response, 200, responseBody);
     }, [{ body: responseBody }]);
     await writeConfig(directory, relay.url);
-    await writeIdentity(directory, relay.url, "prompt-many");
-    await writePromptCursor(directory, "prompt-many", 0);
+    await writeIdentity(directory, relay.url, projectCwd);
+    await writePromptCursor(directory, projectCwd, 0);
 
     const result = await runCli(
       directory,
       ["hook", "prompt-context"],
-      { session_id: "prompt-many", cwd: "/Users/tester/project" },
+      { session_id: "prompt-many", cwd: projectCwd },
       relay.environment,
     );
 
@@ -732,13 +920,13 @@ describe("acommune hook prompt-context", () => {
       sendJson(response, 200, responseBody);
     }, [{ body: responseBody }]);
     await writeConfig(directory, relay.url);
-    await writeIdentity(directory, relay.url, "prompt-malicious");
-    await writePromptCursor(directory, "prompt-malicious", 1);
+    await writeIdentity(directory, relay.url, projectCwd);
+    await writePromptCursor(directory, projectCwd, 1);
 
     const result = await runCli(
       directory,
       ["hook", "prompt-context"],
-      { session_id: "prompt-malicious", cwd: "/Users/tester/project" },
+      { session_id: "prompt-malicious", cwd: projectCwd },
       relay.environment,
     );
 
@@ -766,7 +954,7 @@ describe("acommune hook prompt-context", () => {
     const result = await runCli(
       directory,
       ["hook", "prompt-context"],
-      { session_id: "prompt-no-identity", cwd: "/Users/tester/project" },
+      { session_id: "prompt-no-identity", cwd: projectCwd },
       relay.environment,
     );
 
@@ -774,7 +962,7 @@ describe("acommune hook prompt-context", () => {
     assert.equal(requestCount, 0);
     assert.deepEqual(await relay.requests(), []);
     await assert.rejects(
-      readFile(join(directory, ".acommune", "prompt-cursor-demo.prompt-no-identity.json")),
+      readFile(promptCursorFilePath(directory, projectCwd)),
     );
   });
 
@@ -782,18 +970,18 @@ describe("acommune hook prompt-context", () => {
     const directory = await tempDirectory();
     const relay = await unreachableRelay(directory);
     await writeConfig(directory, relay.url);
-    await writeIdentity(directory, relay.url, "prompt-down");
+    await writeIdentity(directory, relay.url, projectCwd);
 
     const result = await runCli(
       directory,
       ["hook", "prompt-context"],
-      { session_id: "prompt-down", cwd: "/Users/tester/project" },
+      { session_id: "prompt-down", cwd: projectCwd },
       relay.environment,
     );
 
     assert.deepEqual(result, { code: 0, stdout: "", stderr: "" });
     await assert.rejects(
-      readFile(join(directory, ".acommune", "prompt-cursor-demo.prompt-down.json")),
+      readFile(promptCursorFilePath(directory, projectCwd)),
     );
   });
 });
@@ -801,17 +989,19 @@ describe("acommune hook prompt-context", () => {
 describe("acommune hook share-nudge", () => {
   const reason = "acommune: before stopping — if this turn produced a non-obvious learning, decision, or state change another session could need, post ONE short knowledge or progress message to the bus (bus_post). If nothing is worth sharing, just stop.";
 
-  it("nudges once, records the time, and stays silent during the rate limit", async () => {
+  it("persists nudges across session_id changes while isolating different cwd values", async () => {
     const directory = await tempDirectory();
     const relay = "http://127.0.0.1:4477";
+    const otherCwd = "/Users/tester/other-project";
     await writeConfig(directory, relay);
-    await writeIdentity(directory, relay, "nudge-first");
+    await writeIdentity(directory, relay, projectCwd);
+    await writeIdentity(directory, relay, otherCwd);
     const before = Date.now();
 
     const first = await runCli(
       directory,
       ["hook", "share-nudge"],
-      { session_id: "nudge-first", cwd: "/Users/tester/project" },
+      { session_id: "nudge-first", cwd: projectCwd },
     );
 
     assert.deepEqual(first, {
@@ -819,7 +1009,7 @@ describe("acommune hook share-nudge", () => {
       stdout: JSON.stringify({ decision: "block", reason }),
       stderr: "",
     });
-    const statePath = join(directory, ".acommune", "nudge-demo.nudge-first.json");
+    const statePath = nudgeStatePath(directory, projectCwd);
     const firstState = await jsonObject(statePath);
     assert.equal(typeof firstState.last_nudge_at, "number");
     assert.ok(
@@ -831,18 +1021,32 @@ describe("acommune hook share-nudge", () => {
     const second = await runCli(
       directory,
       ["hook", "share-nudge"],
-      { session_id: "nudge-first", cwd: "/Users/tester/project" },
+      { session_id: "nudge-after-switch", cwd: projectCwd },
     );
     assert.deepEqual(second, { code: 0, stdout: "", stderr: "" });
     assert.deepEqual(await jsonObject(statePath), firstState);
+
+    const other = await runCli(
+      directory,
+      ["hook", "share-nudge"],
+      { session_id: "nudge-after-switch", cwd: otherCwd },
+    );
+    assert.deepEqual(other, {
+      code: 0,
+      stdout: JSON.stringify({ decision: "block", reason }),
+      stderr: "",
+    });
+    const otherStatePath = nudgeStatePath(directory, otherCwd);
+    assert.notEqual(statePath, otherStatePath);
+    assert.equal(typeof (await jsonObject(otherStatePath)).last_nudge_at, "number");
   });
 
   it("honors stop_hook_active before creating rate-limit state", async () => {
     const directory = await tempDirectory();
     const relay = "http://127.0.0.1:4477";
     await writeConfig(directory, relay);
-    await writeIdentity(directory, relay, "nudge-loop-guard");
-    const statePath = join(directory, ".acommune", "nudge-demo.nudge-loop-guard.json");
+    await writeIdentity(directory, relay, projectCwd);
+    const statePath = nudgeStatePath(directory, projectCwd);
 
     // Claude Code sets this on the repeated Stop pass; writing state here could mask a loop bug.
     const result = await runCli(
@@ -850,7 +1054,7 @@ describe("acommune hook share-nudge", () => {
       ["hook", "share-nudge"],
       {
         session_id: "nudge-loop-guard",
-        cwd: "/Users/tester/project",
+        cwd: projectCwd,
         stop_hook_active: true,
       },
     );
@@ -862,12 +1066,12 @@ describe("acommune hook share-nudge", () => {
   it("stays silent without an identity and creates no rate-limit state", async () => {
     const directory = await tempDirectory();
     await writeConfig(directory, "http://127.0.0.1:4477");
-    const statePath = join(directory, ".acommune", "nudge-demo.nudge-no-identity.json");
+    const statePath = nudgeStatePath(directory, projectCwd);
 
     const result = await runCli(
       directory,
       ["hook", "share-nudge"],
-      { session_id: "nudge-no-identity", cwd: "/Users/tester/project" },
+      { session_id: "nudge-no-identity", cwd: projectCwd },
     );
 
     assert.deepEqual(result, { code: 0, stdout: "", stderr: "" });
@@ -884,18 +1088,19 @@ describe("acommune hook claim", () => {
       sendJson(response, 500, { error: { code: "TEST_FAILURE", message: "unexpected" } });
     }, [{ status: 500, body: { error: { code: "TEST_FAILURE", message: "unexpected" } } }]);
     await writeConfig(directory, relay.url);
-    await writeIdentity(directory, relay.url, "cached-session");
+    await writeIdentity(directory, relay.url, projectCwd);
     const path = join(directory, "src", "cached.ts");
+    const cacheKey = `${stableSessionKey(projectCwd)}|${path}`;
     await writeFile(
       join(directory, ".acommune", "claims-demo.json"),
-      `${JSON.stringify({ [`cached-session|${path}`]: Date.now() })}\n`,
+      `${JSON.stringify({ [cacheKey]: Date.now() })}\n`,
       "utf8",
     );
 
     const result = await runCli(
       directory,
       ["hook", "claim"],
-      { session_id: "cached-session", tool_input: { file_path: path } },
+      { session_id: "cached-session", cwd: projectCwd, tool_input: { file_path: path } },
       relay.environment,
     );
 
@@ -925,13 +1130,13 @@ describe("acommune hook claim", () => {
       });
     }, [{ body: claimsBody }]);
     await writeConfig(directory, relay.url);
-    await writeIdentity(directory, relay.url, "warning-session");
+    await writeIdentity(directory, relay.url, projectCwd);
     const path = join(directory, "src", "warning.ts");
 
     const result = await runCli(
       directory,
       ["hook", "claim"],
-      { session_id: "warning-session", tool_input: { file_path: path } },
+      { session_id: "warning-session", cwd: projectCwd, tool_input: { file_path: path } },
       relay.environment,
     );
 
@@ -979,13 +1184,13 @@ describe("acommune hook claim", () => {
       { body: { received: [], sent: [], cursor: 8, status: "empty" } },
     ]);
     await writeConfig(directory, relay.url);
-    await writeIdentity(directory, relay.url, "claim-session");
+    await writeIdentity(directory, relay.url, projectCwd);
     const path = join(directory, "src", "claim.ts");
 
     const result = await runCli(
       directory,
       ["hook", "claim"],
-      { session_id: "claim-session", tool_input: { file_path: path } },
+      { session_id: "claim-session", cwd: projectCwd, tool_input: { file_path: path } },
       relay.environment,
     );
 
@@ -1017,20 +1222,86 @@ describe("acommune hook claim", () => {
       wait_seconds: 0,
     });
     const cache = await jsonObject(join(directory, ".acommune", "claims-demo.json"));
-    assert.equal(typeof cache[`claim-session|${path}`], "number");
+    assert.equal(typeof cache[`${stableSessionKey(projectCwd)}|${path}`], "number");
+  });
+
+  it("recognizes its own prior claim after session_id changes in the same cwd", async () => {
+    const directory = await tempDirectory();
+    const path = join(directory, "src", "account-switch.ts");
+    const selfClaim = {
+      session_name: "cc-project",
+      path,
+      claim_seq: 9,
+      refreshed_at: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 10 * 60_000).toISOString(),
+    };
+    const syncBody = { received: [], sent: [], cursor: 9, status: "empty" };
+    let claimPosted = false;
+    let requestCount = 0;
+    const relay = await fakeRelay(directory, async (request, response) => {
+      requestCount += 1;
+      if (request.method === "GET") {
+        sendJson(response, 200, { claims: claimPosted ? [selfClaim] : [] });
+        return;
+      }
+      claimPosted = true;
+      sendJson(response, 200, syncBody);
+    }, [
+      { body: { claims: [] } },
+      { body: syncBody },
+    ]);
+    await writeConfig(directory, relay.url);
+    await writeIdentity(directory, relay.url, projectCwd);
+
+    const first = await runCli(
+      directory,
+      ["hook", "claim"],
+      { session_id: "account-a", cwd: projectCwd, tool_input: { file_path: path } },
+      relay.environment,
+    );
+    assert.deepEqual(first, { code: 0, stdout: "", stderr: "" });
+
+    const cachePath = join(directory, ".acommune", "claims-demo.json");
+    const cacheKey = `${stableSessionKey(projectCwd)}|${path}`;
+    await writeFile(cachePath, `${JSON.stringify({ [cacheKey]: 0 })}\n`, "utf8");
+    const secondEnvironment = {
+      ...relay.environment,
+      ...(relay.environment.NODE_OPTIONS === undefined
+        ? {}
+        : {
+            ACOMMUNE_TEST_FETCH_RESPONSES: JSON.stringify([
+              { body: { claims: [selfClaim] } },
+              { body: syncBody },
+            ]),
+          }),
+    };
+    const second = await runCli(
+      directory,
+      ["hook", "claim"],
+      { session_id: "account-b", cwd: projectCwd, tool_input: { file_path: path } },
+      secondEnvironment,
+    );
+
+    assert.deepEqual(second, { code: 0, stdout: "", stderr: "" });
+    const recorded = await relay.requests();
+    assert.equal(requestCount > 0 ? requestCount : recorded.length, 4);
+    const cache = await jsonObject(cachePath);
+    assert.equal(typeof cache[cacheKey], "number");
+    assert.equal(Object.keys(cache).length, 1);
   });
 
   it("fails open and silently when the relay is unreachable", async () => {
     const directory = await tempDirectory();
     const relay = await unreachableRelay(directory);
     await writeConfig(directory, relay.url);
-    await writeIdentity(directory, relay.url, "down-session");
+    await writeIdentity(directory, relay.url, projectCwd);
 
     const result = await runCli(
       directory,
       ["hook", "claim"],
       {
         session_id: "down-session",
+        cwd: projectCwd,
         tool_input: { file_path: join(directory, "src", "down.ts") },
       },
       relay.environment,

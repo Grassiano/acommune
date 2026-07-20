@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -871,6 +871,14 @@ function sessionIdentityPath(room: string, sessionId: string): string {
   return join(homedir(), ".acommune", "sessions", `${room}.${sessionId}.json`);
 }
 
+function stableSessionKey(cwd: string): string {
+  const normalizedCwd = resolve(cwd).replace(/\\/g, "/");
+  // Intentional tradeoff: two genuinely different Claude Code sessions running
+  // concurrently in one directory share a bus identity. This matches the accepted
+  // one-working-session-per-repo workflow and avoids account-switch duplicate storms.
+  return createHash("sha256").update(normalizedCwd).digest("hex").slice(0, 16);
+}
+
 function isEphemeralSessionCwd(cwd: string, environment: NodeJS.ProcessEnv): boolean {
   const normalizedCwd = resolve(cwd).replace(/\\/g, "/");
   const tempRoots = ["/tmp/", "/private/tmp/", "/var/folders/"];
@@ -891,14 +899,21 @@ async function joinRelaySession(
   code: string,
   baseName: string,
   deadline?: number,
+  preferred?: { preferredName: string; reclaimToken: string },
 ): Promise<WatchIdentity> {
-  for (let attempt = 1; attempt <= 20; attempt += 1) {
-    const sessionName = attempt === 1 ? baseName : `${baseName}-${attempt}`;
+  const attemptJoin = async (
+    sessionName: string,
+    reclaimToken?: string,
+  ): Promise<WatchIdentity | undefined> => {
     const url = `${relay}/rooms/${encodeURIComponent(room)}/join`;
     const init: RequestInit = {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ session_name: sessionName, pairing_code: code }),
+      body: JSON.stringify({
+        session_name: sessionName,
+        pairing_code: code,
+        ...(reclaimToken === undefined ? {} : { reclaim_token: reclaimToken }),
+      }),
     };
     const response = deadline === undefined
       ? await fetch(url, init)
@@ -915,9 +930,28 @@ async function joinRelaySession(
         relay,
       };
     }
-    if (response.status !== 409 || relayErrorCode(result) !== "AGENT_NAME_IN_USE") {
-      throw new Error("Relay rejected session join");
+    if (response.status === 409 && relayErrorCode(result) === "AGENT_NAME_IN_USE") {
+      return undefined;
     }
+    throw new Error("Relay rejected session join");
+  };
+
+  if (preferred !== undefined) {
+    try {
+      const reclaimed = await attemptJoin(
+        preferred.preferredName,
+        preferred.reclaimToken,
+      );
+      if (reclaimed !== undefined) return reclaimed;
+    } catch {
+      // Reclaim is best-effort; every failure falls back to a fresh numbered name.
+    }
+  }
+
+  for (let attempt = 1; attempt <= 20; attempt += 1) {
+    const sessionName = attempt === 1 ? baseName : `${baseName}-${attempt}`;
+    const identity = await attemptJoin(sessionName);
+    if (identity !== undefined) return identity;
   }
   throw new Error("Could not find an available session name after 20 attempts");
 }
@@ -930,15 +964,30 @@ async function runSessionStartHook(): Promise<void> {
     if (config.joinTempDirs !== true && isEphemeralSessionCwd(input.cwd, process.env)) return;
     const deadline = Date.now() + HOOK_HTTP_TIMEOUT_MS;
     const baseName = `${config.sessionNamePrefix ?? "cc"}-${basename(input.cwd)}`;
+    const sessionKey = stableSessionKey(input.cwd);
+    const identityPath = sessionIdentityPath(config.room, sessionKey);
+    let preferred: { preferredName: string; reclaimToken: string } | undefined;
+    try {
+      const existing = await loadSessionIdentity(identityPath);
+      if (existing.room === config.room && existing.relay === config.relay) {
+        preferred = {
+          preferredName: existing.sessionName,
+          reclaimToken: existing.reclaimToken,
+        };
+      }
+    } catch {
+      // Missing or malformed identities simply start a fresh relay session.
+    }
     const identity = await joinRelaySession(
       config.relay,
       config.room,
       config.code,
       baseName,
       deadline,
+      preferred,
     );
     await writePrivateJson(
-      sessionIdentityPath(config.room, input.session_id),
+      identityPath,
       {
         session_name: identity.sessionName,
         reclaim_token: identity.reclaimToken,
@@ -1113,12 +1162,13 @@ async function runPromptContextHook(): Promise<void> {
     if (typeof input.session_id !== "string" || typeof input.cwd !== "string") return;
     const config = await loadAcommuneConfig();
     if (config.joinTempDirs !== true && isEphemeralSessionCwd(input.cwd, process.env)) return;
+    const sessionKey = stableSessionKey(input.cwd);
     const identity = await loadSessionIdentity(
-      sessionIdentityPath(config.room, input.session_id),
+      sessionIdentityPath(config.room, sessionKey),
     );
     if (identity.room !== config.room || identity.relay !== config.relay) return;
 
-    const cursorPath = promptCursorPath(config.room, input.session_id);
+    const cursorPath = promptCursorPath(config.room, sessionKey);
     const afterSeq = await readPromptCursor(cursorPath);
     const fetched = await fetchPromptMessages(
       config,
@@ -1185,12 +1235,13 @@ async function runShareNudgeHook(): Promise<void> {
     if (typeof input.session_id !== "string" || typeof input.cwd !== "string") return;
     const config = await loadAcommuneConfig();
     if (config.joinTempDirs !== true && isEphemeralSessionCwd(input.cwd, process.env)) return;
+    const sessionKey = stableSessionKey(input.cwd);
     const identity = await loadSessionIdentity(
-      sessionIdentityPath(config.room, input.session_id),
+      sessionIdentityPath(config.room, sessionKey),
     );
     if (identity.room !== config.room || identity.relay !== config.relay) return;
 
-    const path = nudgePath(config.room, input.session_id);
+    const path = nudgePath(config.room, sessionKey);
     const lastNudgeAt = await readLastNudgeAt(path);
     const now = Date.now();
     if (lastNudgeAt !== undefined && now - lastNudgeAt < SHARE_NUDGE_INTERVAL_MS) return;
@@ -1223,19 +1274,24 @@ function validateSyncResponse(value: JsonObject): void {
 async function runClaimHook(): Promise<void> {
   try {
     const input = await readStdinJson();
-    if (typeof input.session_id !== "string" || !isJsonObject(input.tool_input)) return;
+    if (
+      typeof input.session_id !== "string" ||
+      typeof input.cwd !== "string" ||
+      !isJsonObject(input.tool_input)
+    ) return;
     const path = input.tool_input.file_path;
     if (typeof path !== "string") return;
 
     const config = await loadAcommuneConfig();
+    const sessionKey = stableSessionKey(input.cwd);
     const identity = await loadSessionIdentity(
-      sessionIdentityPath(config.room, input.session_id),
+      sessionIdentityPath(config.room, sessionKey),
     );
     if (identity.room !== config.room || identity.relay !== config.relay) return;
 
     const claimsPath = cachePath(config.room);
     const cache = await readClaimCache(claimsPath);
-    const cacheKey = `${input.session_id}|${path}`;
+    const cacheKey = `${sessionKey}|${path}`;
     const now = Date.now();
     const cachedAt = cache[cacheKey];
     if (cachedAt !== undefined && now - cachedAt < CLAIM_CACHE_FRESH_MS) return;
